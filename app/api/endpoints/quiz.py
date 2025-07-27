@@ -7,42 +7,56 @@ from datetime import datetime, timedelta
 
 router = APIRouter()
 
-async def run_quiz(bot_token: str, chat_id: str, questions_db_path: str, stats_db_path: str, question_delay: int):
-    # This is a background task that "runs" the quiz
-    # In a real application, this would involve sending messages to the chat
-    quiz_status = await redis_handler.get_quiz_status(bot_token, chat_id)
-    question_ids = json.loads(quiz_status['question_ids'])
 
-    for i, question_id in enumerate(question_ids):
-        await redis_handler.redis_client.hset(redis_handler.quiz_key(bot_token, chat_id), "current_index", i)
-
-        end_time = datetime.now() + timedelta(seconds=question_delay)
-        await redis_handler.set_current_question(bot_token, chat_id, question_id, end_time)
-
-        # Here you would typically send the question to the chat
-
-        await asyncio.sleep(question_delay)
-
-    # Quiz finished, clean up
-    await redis_handler.end_quiz(bot_token, chat_id)
-    # Persist results to SQLite (simplified)
-    # This part would need more logic to gather results from Redis
+from ...services.telegram_bot import TelegramBotServiceAsync
 
 @router.post("/start_competition", status_code=202)
-async def start_competition(request: quiz_models.StartCompetitionRequest, background_tasks: BackgroundTasks):
+async def start_competition(request: quiz_models.StartCompetitionRequest):
     await sqlite_handler.create_tables(request.stats_db_path)
     questions = await sqlite_handler.get_questions(request.questions_db_path, request.total_questions)
     if not questions:
         raise HTTPException(status_code=404, detail="No questions found in the database.")
 
     question_ids = [q['id'] for q in questions]
+    creator_id = 0 # Placeholder
 
-    # Using a placeholder for creator_id
-    creator_id = 0
+    # Send the first question to get the message_id
+    telegram_bot = TelegramBotServiceAsync(request.bot_token)
+    first_question = questions[0]
+    question_text = f"{first_question['question']}\n\n"
+    options = [first_question['opt1'], first_question['opt2'], first_question['opt3'], first_question['opt4']]
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": opt, "callback_data": f"answer_{first_question['id']}_{i}"}] for i, opt in enumerate(options)
+        ]
+    }
+    message_data = {
+        "chat_id": request.channel_id,
+        "text": question_text,
+        "reply_markup": json.dumps(keyboard)
+    }
+    sent_message = await telegram_bot.send_message(message_data)
+    if not sent_message.get("ok"):
+        raise HTTPException(status_code=500, detail=f"Failed to send message to Telegram: {sent_message.get('description')}")
 
-    await redis_handler.start_quiz(request.bot_token, request.channel_id, question_ids, request.question_delay, creator_id)
+    message_id = sent_message["result"]["message_id"]
 
-    background_tasks.add_task(run_quiz, request.bot_token, request.channel_id, request.questions_db_path, request.stats_db_path, request.question_delay)
+    await redis_handler.start_quiz(
+        bot_token=request.bot_token,
+        chat_id=request.channel_id,
+        message_id=message_id,
+        questions_db_path=request.questions_db_path,
+        stats_db_path=request.stats_db_path,
+        question_ids=question_ids,
+        time_per_question=request.question_delay,
+        creator_id=creator_id
+    )
+
+    # Set the first question's timing information
+    end_time = datetime.now() + timedelta(seconds=request.question_delay)
+    await redis_handler.set_current_question(request.bot_token, request.channel_id, first_question['id'], end_time)
+    await redis_handler.redis_client.hset(redis_handler.quiz_key(request.bot_token, request.channel_id), "current_index", 0)
+
 
     return {"message": "Competition started."}
 

@@ -1,64 +1,20 @@
-# QuizAPI
-RESTful API for managing questions, quizzes, and user interactions in an educational or competitive system.
+# Religious Questions Bot API
 
-# 📘 SualAPI
+This is a simple API for a religious questions bot.
 
-**QuizAPI** is a RESTful web API built to manage questions, quizzes, and user answers within a flexible and scalable system. It supports multiple use cases such as public question banks, private bot-specific quizzes, and user point tracking.
+## Running the API
 
----
-
-## 🚀 Features
-
-- ✅ Create, update, and delete questions
-- 🔄 Support for public and private question sets
-- 📊 User submissions tracking
-- 🧠 Points, rankings, and stats
-- ⏱️ Time-limited quizzes and competitions
-- 🗂️ Redis-based storage (high performance)
-- 🔐 Token-based authentication (optional)
-
----
-## 🧪 Example Endpoints
-
-GET    /questions/public POST   /questions/private POST   /answers/submit GET    /stats/user/{user_id}
-
----
-
-## ⚙️ Installation
+To run the API, you can use uvicorn:
 
 ```bash
-git clone https://github.com/yourusername/SualAPI.git
-cd SualAPI
-pip install -r requirements.txt
-uvicorn api.main:app --reload
+uvicorn app.main:app --reload
+```
 
+## Running the Worker
 
----
+The worker is responsible for processing active quizzes. To run the worker, you need to set the `PYTHONPATH` to the root of the project and then run the `worker.py` file.
 
-📌 Environment Variables
-
-Create a .env file and configure the following:
-
-REDIS_URL=redis://localhost:6379
-SECRET_KEY=your_secret_here
-
-
----
-
-📬 License
-
-MIT License
-
-
----
-
-🤝 Contributing
-
-Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
-
-
----
-
-💡 Author
-
-Made with ❤️ by Rabie A.
+```bash
+export PYTHONPATH=$(pwd)
+python app/worker.py
+```

@@ -20,21 +20,28 @@ def quiz_time_key(bot_token: str, chat_id: str) -> str:
 def answered_key(bot_token: str, chat_id: str, question_id: int, user_id: int) -> str:
     return f"Answered:{bot_token}:{chat_id}:{question_id}:{user_id}"
 
-async def start_quiz(bot_token: str, chat_id: str, question_ids: list, time_per_question: int, creator_id: int):
+async def start_quiz(bot_token: str, chat_id: str, message_id: int, questions_db_path: str, stats_db_path: str, question_ids: list, time_per_question: int, creator_id: int):
     key = quiz_key(bot_token, chat_id)
     quiz_data = {
         "status": "active",
         "question_ids": json.dumps(question_ids),
-        "current_index": 0,
+        "current_index": -1,
         "time_per_question": time_per_question,
         "start_time": datetime.now().isoformat(),
         "last_question_time": datetime.now().isoformat(),
-        "creator_id": creator_id
+        "creator_id": creator_id,
+        "bot_token": bot_token,
+        "message_id": message_id,
+        "questions_db_path": questions_db_path,
+        "stats_db_path": stats_db_path
     }
     await redis_client.hmset(key, quiz_data)
 
 async def get_quiz_status(bot_token: str, chat_id: str):
     key = quiz_key(bot_token, chat_id)
+    return await redis_client.hgetall(key)
+
+async def get_quiz_status_by_key(key: str):
     return await redis_client.hgetall(key)
 
 async def set_current_question(bot_token: str, chat_id: str, question_id: int, end_time: datetime):

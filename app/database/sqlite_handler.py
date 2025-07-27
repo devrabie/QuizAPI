@@ -52,9 +52,17 @@ async def create_tables(db_path: str):
 
 async def get_questions(db_path: str, limit: int) -> list:
     async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM questions ORDER BY RANDOM() LIMIT ?", (limit,))
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+async def get_question_by_id(db_path: str, question_id: int) -> dict:
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM questions WHERE id = ?", (question_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
 
 async def update_user_stats(db_path: str, user_id: int, username: str, score: int, correct: bool):
     async with aiosqlite.connect(db_path) as db:
