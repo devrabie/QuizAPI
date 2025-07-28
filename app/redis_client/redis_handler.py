@@ -2,8 +2,13 @@ import redis.asyncio as redis
 import json
 from datetime import datetime, timedelta
 
-# This should be configured from a central place
-redis_client = redis.Redis(decode_responses=True)
+# This should be configured from a central place (e.g., environment variables)
+# For local development, it might be 'localhost' or 'redis' if using Docker Compose
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_DB = int(os.getenv("REDIS_DB", 0))
+
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
 
 def quiz_key(bot_token: str, chat_id: str) -> str:
     return f"Quiz:{bot_token}:{chat_id}"
@@ -52,22 +57,31 @@ async def set_current_question(bot_token: str, chat_id: str, question_id: int, e
         "end": end_time.isoformat()
     }
     await redis_client.hmset(key, time_data)
+    # The expireat should be enough to clean up quiz_time, but the worker also manages its state.
+    # Add a small buffer to ensure the worker has time to process after expiry.
     await redis_client.expireat(key, end_time + timedelta(seconds=5))
 
 async def has_answered(bot_token: str, chat_id: str, question_id: int, user_id: int) -> bool:
     key = answered_key(bot_token, chat_id, question_id, user_id)
     return await redis_client.exists(key)
 
-async def record_answer(bot_token: str, chat_id: str, question_id: int, user_id: int, score: int, time_per_question: int):
+# Modified to accept username
+async def record_answer(bot_token: str, chat_id: str, question_id: int, user_id: int, username: str, score: int, time_per_question: int):
     answered_key_str = answered_key(bot_token, chat_id, question_id, user_id)
+    # Set expiration for the answered flag slightly longer than question time
     await redis_client.setex(answered_key_str, time_per_question + 5, "true")
 
     answers_key = quiz_answers_key(bot_token, chat_id, user_id)
+
+    # Store username along with score
+    await redis_client.hset(answers_key, "username", username)
     await redis_client.hincrby(answers_key, "score", score)
     await redis_client.hset(answers_key, f"answers.{question_id}", score)
 
+
 async def end_quiz(bot_token: str, chat_id: str):
     # This is a simplified cleanup. In a real scenario, you might want to archive results.
+    # The worker handles archiving to SQLite before calling this.
     keys_to_delete = await redis_client.keys(f"Quiz*{bot_token}:{chat_id}*")
     if keys_to_delete:
         await redis_client.delete(*keys_to_delete)
