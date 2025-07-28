@@ -64,18 +64,20 @@ async def get_question_by_id(db_path: str, question_id: int) -> dict:
         row = await cursor.fetchone()
         return dict(row) if row else None
 
-async def update_user_stats(db_path: str, user_id: int, username: str, score: int, correct: bool):
+# Modified to accept correct_answers and wrong_answers directly
+async def update_user_stats(db_path: str, user_id: int, username: str, total_points_earned: int, correct_answers_count: int, wrong_answers_count: int):
     async with aiosqlite.connect(db_path) as db:
         await db.execute("""
             INSERT INTO user_stats (user_id, username, total_points, total_answers, correct_answers, wrong_answers, last_participation)
-            VALUES (?, ?, ?, 1, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username, -- Update username in case it changed
                 total_points = total_points + excluded.total_points,
-                total_answers = total_answers + 1,
+                total_answers = total_answers + (excluded.correct_answers + excluded.wrong_answers),
                 correct_answers = correct_answers + excluded.correct_answers,
                 wrong_answers = wrong_answers + excluded.wrong_answers,
                 last_participation = excluded.last_participation
-        """, (user_id, username, score, 1 if correct else 0, 1 if not correct else 0, datetime.now()))
+        """, (user_id, username, total_points_earned, correct_answers_count + wrong_answers_count, correct_answers_count, wrong_answers_count, datetime.now()))
         await db.commit()
 
 async def save_quiz_history(db_path: str, chat_id: str, total_questions: int, winner_id: int, winner_score: int):
@@ -97,6 +99,7 @@ async def save_quiz_participant(db_path: str, quiz_id: int, user_id: int, score:
 
 async def get_leaderboard(db_path: str, limit: int = 10) -> list:
     async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT user_id, username, total_points FROM user_stats ORDER BY total_points DESC LIMIT ?", (limit,))
         rows = await cursor.fetchall()
-        return [{"user_id": row[0], "username": row[1], "score": row[2]} for row in rows]
+        return [{"user_id": row["user_id"], "username": row["username"], "score": row["total_points"]} for row in rows]
