@@ -1,0 +1,13 @@
+[Unit]
+Description=Quiz API Service
+After=network.target
+
+[Service]
+User=jules
+Group=jules
+WorkingDirectory=/app
+ExecStart=/home/jules/.pyenv/versions/3.12.11/bin/uvicorn app.main:app --host 0.0.0.0 --port 8004
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
