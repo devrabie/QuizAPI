@@ -1,6 +1,7 @@
 import redis.asyncio as redis
 import json
 from datetime import datetime, timedelta
+import os
 
 # This should be configured from a central place (e.g., environment variables)
 # For local development, it might be 'localhost' or 'redis' if using Docker Compose
