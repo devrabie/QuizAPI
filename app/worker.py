@@ -53,13 +53,14 @@ async def process_active_quiz(quiz_key: str):
         return
 
     bot_token = quiz_status.get("bot_token")
+    chat_id = quiz_status.get("chat_id") # Extract chat_id from the key
     if not bot_token:
         logger.error(f"Worker: [{quiz_key}] Bot token not found in status. Cleaning up broken state.")
         # Perform emergency cleanup by deleting the main quiz key
         await redis_handler.redis_client.delete(quiz_key)
         return
 
-    chat_id = quiz_key.split(":")[2] # Extract chat_id from the key
+    # chat_id = quiz_key.split(":")[2] # Extract chat_id from the key
     telegram_bot = get_telegram_bot(bot_token)
     quiz_time_key = redis_handler.quiz_time_key(bot_token, chat_id)
     quiz_time = await redis_handler.redis_client.hgetall(quiz_time_key)
@@ -122,7 +123,7 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
         options = [question['opt1'], question['opt2'], question['opt3'], question['opt4']]
         keyboard = {"inline_keyboard": [[{"text": opt, "callback_data": f"answer_{next_question_id}_{i}"}] for i, opt in enumerate(options)]}
 
-        chat_id = quiz_key.split(":")[2] # Ensure this extracts the CORRECT chat_id
+        chat_id =  quiz_status.get("chat_id")# Ensure this extracts the CORRECT chat_id
         message_id = int(quiz_status.get("message_id")) # message_id is retrieved from Redis
         message_data = {
             "chat_id": chat_id,
@@ -174,7 +175,8 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
         await redis_handler.redis_client.delete(lock_key)
         return
 
-    chat_id = quiz_key.split(":")[2]
+    # chat_id = quiz_key.split(":")[2]
+    chat_id =  quiz_status.get("chat_id")
     message_id = int(quiz_status.get("message_id")) # message_id is retrieved from quiz_status
     stats_db_path = quiz_status.get("stats_db_path")
 

@@ -32,7 +32,9 @@ def answered_key(bot_token: str, chat_id: str, question_id: int, user_id: int) -
 async def start_quiz(bot_token: str, chat_id: str, message_id: int, questions_db_path: str, stats_db_path: str, question_ids: list, time_per_question: int, creator_id: int):
     key = quiz_key(bot_token, chat_id)
     quiz_data = {
+
         "status": "initializing", # Set initial status
+        "chat_id": chat_id,
         "question_ids": json.dumps(question_ids),
         "current_index": -1, # Set initial index
         "time_per_question": time_per_question,
