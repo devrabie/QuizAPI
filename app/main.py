@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, Security
 from fastapi.security import APIKeyHeader
 
 from .api.endpoints import quiz
-from ..config import SECRET_TOKEN
+from config import SECRET_TOKEN
 
 app = FastAPI(title="Religious Questions Bot API")
 
