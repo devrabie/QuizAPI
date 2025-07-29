@@ -3,6 +3,8 @@ import json
 import os
 from datetime import datetime, timedelta
 
+from app.worker import logger
+
 # This should be configured from a central place (e.g., environment variables)
 # For local development, it might be 'localhost' or 'redis' if using Docker Compose
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
@@ -84,9 +86,31 @@ async def record_answer(bot_token: str, chat_id: str, question_id: int, user_id:
     await redis_client.hset(answers_key, f"answers.{question_id}", score)
 
 
+# --- الإصلاح الحاسم هنا ---
 async def end_quiz(bot_token: str, chat_id: str):
-    # This is a simplified cleanup. In a real scenario, you might want to archive results.
-    # The worker handles archiving to SQLite before calling this.
-    keys_to_delete = await redis_client.keys(f"Quiz*{bot_token}:{chat_id}*")
-    if keys_to_delete:
-        await redis_client.delete(*keys_to_delete)
+    # Gather all related keys using specific patterns
+    # Use SCAN_ITER for production to avoid blocking for many keys
+    quiz_main_key = quiz_key(bot_token, chat_id)
+    quiz_time_k = quiz_time_key(bot_token, chat_id)
+
+    # Collect keys to delete
+    keys_to_delete_list = [quiz_main_key, quiz_time_k]
+
+    # Scan for user answer keys and individual answered flags
+    async for key in redis_client.scan_iter(f"QuizAnswers:{bot_token}:{chat_id}:*"):
+        keys_to_delete_list.append(key)
+    async for key in redis_client.scan_iter(f"Answered:{bot_token}:{chat_id}:*:*"):
+        keys_to_delete_list.append(key)
+
+    # Also delete the end_quiz lock key if it exists, for robustness
+    lock_key_for_end_quiz = f"Lock:EndQuiz:{quiz_main_key}" # Must match the key used in worker.py
+    if await redis_client.exists(lock_key_for_end_quiz):
+        keys_to_delete_list.append(lock_key_for_end_quiz)
+
+    if keys_to_delete_list:
+        # Use pipeline for atomic deletion if there are many keys, or just delete directly
+        # For simplicity, direct delete is fine unless you hit performance issues
+        await redis_client.delete(*keys_to_delete_list)
+        logger.info(f"Redis cleanup complete for bot {bot_token}, chat {chat_id}. Deleted {len(keys_to_delete_list)} keys.")
+    else:
+        logger.info(f"No specific Redis keys found for cleanup for bot {bot_token}, chat {chat_id}.")
