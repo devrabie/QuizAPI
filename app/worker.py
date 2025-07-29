@@ -122,7 +122,9 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
         await redis_handler.redis_client.hset(quiz_key, "current_index", next_index)
 
     else:
-        logger.info(f"End of questions for quiz {quiz_key}. Finishing up.")
+        logger.info(f"End of questions for quiz {quiz_key}. Waiting for 10 seconds before calculating results.")
+        await asyncio.sleep(10) # Wait for 10 seconds for any last-minute answers
+        logger.info(f"Finishing up quiz {quiz_key}.")
         await end_quiz(quiz_key, quiz_status, telegram_bot) # Pass stats_db_path
 
 
