@@ -28,8 +28,8 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
 
     # Check if a quiz is already active for this bot/chat
     current_quiz_status = await redis_handler.get_quiz_status(request.bot_token, request.channel_id)
-    if current_quiz_status and current_quiz_status.get("status") == "active":
-        raise HTTPException(status_code=400, detail="A competition is already active in this channel.")
+    if current_quiz_status:
+        raise HTTPException(status_code=400, detail="A competition is already active or being processed in this channel.")
 
     # Send the first question to get the message_id
     telegram_bot = TelegramBotServiceAsync(request.bot_token)
