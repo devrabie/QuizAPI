@@ -29,7 +29,7 @@ def answered_key(bot_token: str, chat_id: str, question_id: int, user_id: int) -
 async def start_quiz(bot_token: str, chat_id: str, message_id: int, questions_db_path: str, stats_db_path: str, question_ids: list, time_per_question: int, creator_id: int):
     key = quiz_key(bot_token, chat_id)
     quiz_data = {
-        "status": "active",
+        "status": "initializing",
         "question_ids": json.dumps(question_ids),
         "current_index": -1,
         "time_per_question": time_per_question,
@@ -42,6 +42,10 @@ async def start_quiz(bot_token: str, chat_id: str, message_id: int, questions_db
         "stats_db_path": stats_db_path
     }
     await redis_client.hmset(key, quiz_data)
+
+async def activate_quiz(bot_token: str, chat_id: str):
+    key = quiz_key(bot_token, chat_id)
+    await redis_client.hset(key, "status", "active")
 
 async def get_quiz_status(bot_token: str, chat_id: str):
     key = quiz_key(bot_token, chat_id)

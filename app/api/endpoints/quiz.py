@@ -75,6 +75,9 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     await redis_handler.set_current_question(request.bot_token, request.channel_id, first_question['id'], end_time)
     await redis_handler.redis_client.hset(redis_handler.quiz_key(request.bot_token, request.channel_id), "current_index", 0)
 
+    # Activate the quiz so the worker can pick it up
+    await redis_handler.activate_quiz(request.bot_token, request.channel_id)
+
     logger.info(f"Competition started successfully for bot {request.bot_token} in channel {request.channel_id}")
     return {"message": "Competition started."}
 
