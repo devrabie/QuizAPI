@@ -5,7 +5,7 @@ import logging
 import os
 
 # Set up detailed logging
-# You can change level to logging.DEBUG to see more verbose logs for troubleshooting
+# To see DEBUG messages, set level to logging.DEBUG
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -15,8 +15,6 @@ try:
     from app.database import sqlite_handler
     from app.services.telegram_bot import TelegramBotServiceAsync
 except ImportError:
-    # This block allows running the worker directly from within the app folder for testing
-    # but the primary way should be from the project root (PYTHONPATH=. python app/worker.py).
     import sys
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
     from app.redis_client import redis_handler
@@ -33,63 +31,58 @@ def get_telegram_bot(token: str) -> TelegramBotServiceAsync:
     return bot_instances[token]
 
 async def process_active_quiz(quiz_key: str):
-    logger.info(f"Processing quiz key: {quiz_key}")
+    logger.info(f"Worker: Processing quiz key: {quiz_key}")
     quiz_status = await redis_handler.get_quiz_status_by_key(quiz_key)
 
     if not quiz_status:
-        logger.warning(f"[{quiz_key}] No status found in Redis. It might have been cleaned up. Skipping.")
+        logger.warning(f"Worker: [{quiz_key}] No status found in Redis. It might have been cleaned up. Skipping.")
         return
 
     # If the status is "stopping", let end_quiz handle it, but prevent loops.
-    # The `end_quiz` function now includes a lock to prevent re-entry.
     if quiz_status.get("status") == "stopping":
-        logger.info(f"[{quiz_key}] Found in 'stopping' state. Attempting to finalize.")
+        logger.info(f"Worker: [{quiz_key}] Found in 'stopping' state. Attempting to finalize.")
         bot_token = quiz_status.get("bot_token")
         if bot_token:
             await end_quiz(quiz_key, quiz_status, get_telegram_bot(bot_token))
         else:
-            logger.error(f"[{quiz_key}] Cannot finalize 'stopping' quiz, bot_token is missing.")
+            logger.error(f"Worker: [{quiz_key}] Cannot finalize 'stopping' quiz, bot_token is missing.")
         return
 
-    # Only process quizzes that are explicitly "active" for question progression
     if quiz_status.get("status") != "active":
-        logger.info(f"[{quiz_key}] Status is not 'active' (it's '{quiz_status.get('status')}'). Skipping question progression.")
+        logger.info(f"Worker: [{quiz_key}] Status is not 'active' (it's '{quiz_status.get('status')}'). Skipping question progression.")
         return
 
     bot_token = quiz_status.get("bot_token")
     if not bot_token:
-        logger.error(f"[{quiz_key}] Bot token not found in status. Cleaning up broken state.")
+        logger.error(f"Worker: [{quiz_key}] Bot token not found in status. Cleaning up broken state.")
         # Perform emergency cleanup by deleting the main quiz key
         await redis_handler.redis_client.delete(quiz_key)
         return
 
-    chat_id = quiz_key.split(":")[2]
+    chat_id = quiz_key.split(":")[2] # Extract chat_id from the key
     telegram_bot = get_telegram_bot(bot_token)
     quiz_time_key = redis_handler.quiz_time_key(bot_token, chat_id)
     quiz_time = await redis_handler.redis_client.hgetall(quiz_time_key)
 
-    logger.debug(f"[{quiz_key}] Full Status: {quiz_status}")
-    logger.debug(f"[{quiz_key}] Timing Info: {quiz_time}")
+    logger.debug(f"Worker: [{quiz_key}] Full Status: {quiz_status}")
+    logger.debug(f"Worker: [{quiz_key}] Timing Info: {quiz_time}")
 
     should_process_next_question = False
     if quiz_time and "end" in quiz_time:
         try:
             end_time = datetime.fromisoformat(quiz_time["end"])
             if datetime.now() >= end_time:
-                logger.info(f"[{quiz_key}] Question timer has expired. Proceeding to next question.")
+                logger.info(f"Worker: [{quiz_key}] Question timer has expired. Proceeding to next question.")
                 should_process_next_question = True
             else:
                 time_left = (end_time - datetime.now()).total_seconds()
-                logger.debug(f"[{quiz_key}] Timer active. {time_left:.1f}s left. Waiting.")
-                return # This is the normal waiting state, so we exit here.
+                logger.debug(f"Worker: [{quiz_key}] Timer active. {time_left:.1f}s left. Waiting.")
+                return
         except (ValueError, TypeError):
-            logger.error(f"[{quiz_key}] Invalid end_time format: {quiz_time.get('end')}. Forcing next question.")
+            logger.error(f"Worker: [{quiz_key}] Invalid end_time format: {quiz_time.get('end')}. Forcing next question.")
             should_process_next_question = True
     else:
-        # If quiz_time is empty, it means either:
-        # 1. It's the very first time the worker processes a newly started quiz (current_index = 0 from FastAPI).
-        # 2. The quiz_time key expired/was deleted, and we need to move to the next question.
-        logger.info(f"[{quiz_key}] No active question timer found. Assuming it's time for the next question.")
+        logger.info(f"Worker: [{quiz_key}] No active question timer found. Assuming it's time for the next question.")
         should_process_next_question = True
 
     if should_process_next_question:
@@ -97,62 +90,59 @@ async def process_active_quiz(quiz_key: str):
 
 async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotServiceAsync):
     current_index = int(quiz_status.get("current_index", -1))
-    question_ids_str = quiz_status.get("question_ids", "[]") # Get as string first
+    question_ids_str = quiz_status.get("question_ids", "[]")
 
     try:
-        question_ids = json.loads(question_ids_str) # Then parse
+        question_ids = json.loads(question_ids_str)
     except json.JSONDecodeError:
-        logger.error(f"[{quiz_key}] Failed to decode question_ids JSON string: {question_ids_str}. Ending quiz.")
+        logger.error(f"Worker: [{quiz_key}] Failed to decode question_ids JSON string: {question_ids_str}. Ending quiz.")
         await end_quiz(quiz_key, quiz_status, telegram_bot)
         return
 
     next_index = current_index + 1
 
-    logger.info(f"[{quiz_key}] Handling next question logic. Current Index: {current_index}, Next Index: {next_index}, Total Qs: {len(question_ids)}")
+    logger.info(f"Worker: [{quiz_key}] Handling next question logic. Current Index: {current_index}, Next Index: {next_index}, Total Qs: {len(question_ids)}")
 
     if next_index < len(question_ids):
         next_question_id = question_ids[next_index]
         questions_db_path = quiz_status.get("questions_db_path")
 
         if not questions_db_path:
-            logger.error(f"[{quiz_key}] 'questions_db_path' missing in quiz status. Cannot fetch question. Ending quiz.")
+            logger.error(f"Worker: [{quiz_key}] 'questions_db_path' missing in quiz status. Cannot fetch question. Ending quiz.")
             await end_quiz(quiz_key, quiz_status, telegram_bot)
             return
 
         question = await sqlite_handler.get_question_by_id(questions_db_path, next_question_id)
         if not question:
-            logger.error(f"[{quiz_key}] Question ID {next_question_id} not found in DB '{questions_db_path}'. Ending quiz.")
+            logger.error(f"Worker: [{quiz_key}] Question ID {next_question_id} not found in DB '{questions_db_path}'. Ending quiz.")
             await end_quiz(quiz_key, quiz_status, telegram_bot)
             return
 
         question_text = f"**السؤال {next_index + 1}**: {question['question']}"
         options = [question['opt1'], question['opt2'], question['opt3'], question['opt4']]
-        # Ensure callback_data is unique per option and question for robustness
         keyboard = {"inline_keyboard": [[{"text": opt, "callback_data": f"answer_{next_question_id}_{i}"}] for i, opt in enumerate(options)]}
 
-        chat_id = quiz_key.split(":")[2]
-        message_id = int(quiz_status.get("message_id"))
+        chat_id = quiz_key.split(":")[2] # Ensure this extracts the CORRECT chat_id
+        message_id = int(quiz_status.get("message_id")) # message_id is retrieved from Redis
         message_data = {
             "chat_id": chat_id,
-            "message_id": message_id, # Crucial for editing the same message
+            "message_id": message_id, # This is the original message ID
             "text": question_text,
             "reply_markup": json.dumps(keyboard),
             "parse_mode": "Markdown"
         }
 
-        logger.info(f"[{quiz_key}] Attempting to edit message {message_id} in chat {chat_id} with Q{next_index + 1} (ID: {next_question_id}).")
+        logger.info(f"Worker: [{quiz_key}] Attempting to edit message {message_id} in chat {chat_id} with Q{next_index + 1} (ID: {next_question_id}).")
         try:
             response = await telegram_bot.edit_message(message_data)
-            logger.info(f"[{quiz_key}] Telegram API response for edit_message: {response}")
+            logger.info(f"Worker: [{quiz_key}] Telegram API response for edit_message: {response}")
             if not response.get("ok"):
-                logger.error(f"[{quiz_key}] Telegram reported failure to edit message: {response.get('description')}. Ending quiz.")
-                # If message can't be edited (e.g., deleted by user, bot not admin), end the quiz gracefully.
+                logger.error(f"Worker: [{quiz_key}] Telegram reported failure to edit message: {response.get('description')}. Ending quiz.")
                 await end_quiz(quiz_key, quiz_status, telegram_bot)
                 return
-            logger.info(f"[{quiz_key}] Question {next_index + 1} (ID: {next_question_id}) sent/edited successfully.")
+            logger.info(f"Worker: [{quiz_key}] Question {next_index + 1} (ID: {next_question_id}) sent/edited successfully.")
         except Exception as e:
-            logger.error(f"[{quiz_key}] Exception while editing message: {e}", exc_info=True)
-            # This indicates a severe issue with Telegram API, so end the quiz.
+            logger.error(f"Worker: [{quiz_key}] Exception while editing message: {e}", exc_info=True)
             await end_quiz(quiz_key, quiz_status, telegram_bot)
             return
 
@@ -162,53 +152,49 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
         bot_token = quiz_status.get("bot_token")
         await redis_handler.set_current_question(bot_token, chat_id, next_question_id, end_time)
         await redis_handler.redis_client.hset(quiz_key, "current_index", next_index)
-        logger.info(f"[{quiz_key}] State updated. New current_index: {next_index}. Timer set for {time_per_question}s.")
+        logger.info(f"Worker: [{quiz_key}] State updated. New current_index: {next_index}. Timer set for {time_per_question}s.")
 
     else:
-        logger.info(f"[{quiz_key}] End of questions reached (next index {next_index} is not less than total {len(question_ids)}). Finishing up.")
+        logger.info(f"Worker: [{quiz_key}] End of questions reached. Finishing up.")
         await end_quiz(quiz_key, quiz_status, telegram_bot)
 
 
 async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotServiceAsync):
     # --- LOCK MECHANISM TO PREVENT DEATH LOOPS ---
-    # `nx=True` means set only if the key does NOT exist (acquire lock).
-    # `ex=60` means the lock will expire in 60 seconds automatically, preventing permanent blocks.
     lock_key = f"Lock:EndQuiz:{quiz_key}"
     if not await redis_handler.redis_client.set(lock_key, "true", ex=60, nx=True):
-        logger.warning(f"[{quiz_key}] End process is already locked or in progress. Skipping to prevent loop.")
+        logger.warning(f"Worker: [{quiz_key}] End process is already locked or in progress. Skipping to prevent loop.")
         return
 
-    logger.info(f"[{quiz_key}] Starting end_quiz process (lock acquired).")
+    logger.info(f"Worker: [{quiz_key}] Starting end_quiz process (lock acquired).")
 
     bot_token = quiz_status.get("bot_token")
     if not bot_token:
-        logger.error(f"[{quiz_key}] Cannot end quiz, bot_token is missing. Releasing lock and exiting.")
-        await redis_handler.redis_client.delete(lock_key) # Clean up lock manually if error
+        logger.error(f"Worker: [{quiz_key}] Cannot end quiz, bot_token is missing. Releasing lock and exiting.")
+        await redis_handler.redis_client.delete(lock_key)
         return
 
     chat_id = quiz_key.split(":")[2]
-    message_id = int(quiz_status.get("message_id"))
+    message_id = int(quiz_status.get("message_id")) # message_id is retrieved from quiz_status
     stats_db_path = quiz_status.get("stats_db_path")
 
     if not stats_db_path:
-        logger.error(f"[{quiz_key}] 'stats_db_path' not found in quiz status. Cannot save results to SQLite.")
-        # Attempt to send final message and cleanup Redis anyway
+        logger.error(f"Worker: [{quiz_key}] 'stats_db_path' not found in quiz status. Cannot save results to SQLite.")
         results_text = "🏆 **المسابقة انتهت!** 🏆\n\nحدث خطأ في حفظ النتائج. يرجى مراجعة سجلات الخادم."
         message_data = {"chat_id": chat_id, "message_id": message_id, "text": results_text, "reply_markup": json.dumps({}), "parse_mode": "Markdown"}
         try:
             await telegram_bot.edit_message(message_data)
-            logger.info(f"[{quiz_key}] Error message sent to Telegram due to missing stats_db_path.")
+            logger.info(f"Worker: [{quiz_key}] Error message sent to Telegram due to missing stats_db_path.")
         except Exception as e:
-            logger.error(f"[{quiz_key}] Failed to send error message to Telegram: {e}", exc_info=True)
+            logger.error(f"Worker: [{quiz_key}] Failed to send error message to Telegram: {e}", exc_info=True)
         await redis_handler.end_quiz(bot_token, chat_id)
-        await redis_handler.redis_client.delete(lock_key) # Release lock
+        await redis_handler.redis_client.delete(lock_key)
         return
 
     total_questions = len(json.loads(quiz_status.get("question_ids", "[]")))
 
-    logger.info(f"[{quiz_key}] Calculating results from Redis.")
+    logger.info(f"Worker: [{quiz_key}] Calculating results from Redis.")
     final_scores = {}
-    # Use SCAN_ITER instead of KEYS for large number of keys for performance and avoiding blocking Redis
     async for key in redis_handler.redis_client.scan_iter(f"QuizAnswers:{bot_token}:{chat_id}:*"):
         try:
             user_id = int(key.split(":")[-1])
@@ -223,16 +209,16 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
                         q_id = int(k.split('.')[1])
                         user_answers[q_id] = int(v)
                     except ValueError:
-                        logger.warning(f"[{quiz_key}] Malformed answer key/value for user {user_id}, key {k}: {v}")
+                        logger.warning(f"Worker: [{quiz_key}] Malformed answer key/value for user {user_id}, key {k}: {v}")
 
             final_scores[user_id] = {'score': score, 'username': username, 'answers': user_answers}
-            logger.debug(f"[{quiz_key}] Collected results for user {user_id}: score={score}, username={username}")
+            logger.debug(f"Worker: [{quiz_key}] Collected results for user {user_id}: score={score}, username={username}")
         except (ValueError, IndexError) as e:
-            logger.warning(f"[{quiz_key}] Could not parse user data from answer key '{key}': {e}")
+            logger.warning(f"Worker: [{quiz_key}] Could not parse user data from answer key '{key}': {e}")
             continue
 
     sorted_participants = sorted(final_scores.items(), key=lambda item: item[1]['score'], reverse=True)
-    winner_id, winner_score, winner_username = (None, 0, "لا يوجد") # Default values
+    winner_id, winner_score, winner_username = (None, 0, "لا يوجد")
     if sorted_participants:
         winner_id, winner_data = sorted_participants[0]
         winner_score, winner_username = winner_data['score'], winner_data['username']
@@ -245,79 +231,68 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
 
     if len(sorted_participants) > 0:
         results_text += "🏅 **لوحة المتصدرين:**\n"
-        for i, (user_id, data) in enumerate(sorted_participants[:10]): # Top 10 participants
+        for i, (user_id, data) in enumerate(sorted_participants[:10]):
             results_text += f"{i+1}. {data['username']}: {data['score']} نقطة\n"
     else:
         results_text += "لا توجد نتائج لعرضها.\n"
 
     try:
-        logger.info(f"[{quiz_key}] Saving quiz history and updating user stats in SQLite DB: {stats_db_path}")
+        logger.info(f"Worker: [{quiz_key}] Saving quiz history and updating user stats in SQLite DB: {stats_db_path}")
         quiz_history_id = await sqlite_handler.save_quiz_history(stats_db_path, chat_id, total_questions, winner_id, winner_score)
 
         for user_id, data in final_scores.items():
             total_points = data['score']
             username = data['username']
-            # Correct/wrong answers need to be calculated based on individual question scores
             correct_answers_count = sum(1 for q_score in data['answers'].values() if q_score > 0)
-            # total_answers_in_quiz might be different from len(data['answers']) if some questions were unanswered.
-            # Here, we count all answered questions for which we have a score recorded.
             total_answered_questions_count = len(data['answers'])
             wrong_answers_count = total_answered_questions_count - correct_answers_count
 
             await sqlite_handler.update_user_stats(stats_db_path, user_id, username, total_points, correct_answers_count, wrong_answers_count)
             await sqlite_handler.save_quiz_participant(stats_db_path, quiz_history_id, user_id, total_points, data['answers'])
 
-        logger.info(f"[{quiz_key}] Quiz results saved to SQLite successfully.")
+        logger.info(f"Worker: [{quiz_key}] Quiz results saved to SQLite successfully.")
     except Exception as e:
-        logger.error(f"[{quiz_key}] Failed to save quiz results to SQLite: {e}", exc_info=True)
+        logger.error(f"Worker: [{quiz_key}] Failed to save quiz results to SQLite: {e}", exc_info=True)
 
     message_data = {"chat_id": chat_id, "message_id": message_id, "text": results_text, "reply_markup": json.dumps({}), "parse_mode": "Markdown"}
     try:
         await telegram_bot.edit_message(message_data)
-        logger.info(f"[{quiz_key}] Final results message sent to Telegram.")
+        logger.info(f"Worker: [{quiz_key}] Final results message sent to Telegram.")
     except Exception as e:
-        logger.error(f"[{quiz_key}] Failed to send final message to Telegram: {e}", exc_info=True)
+        logger.error(f"Worker: [{quiz_key}] Failed to send final message to Telegram: {e}", exc_info=True)
 
     # Final cleanup of all Redis keys for this quiz
     await redis_handler.end_quiz(bot_token, chat_id)
-    # Also explicitly delete the lock key if it wasn't already handled.
-    await redis_handler.redis_client.delete(lock_key)
-    logger.info(f"[{quiz_key}] Quiz has ended and been cleaned up from Redis, including the lock.")
+    await redis_handler.redis_client.delete(lock_key) # Explicitly delete the end_quiz lock key
+    logger.info(f"Worker: [{quiz_key}] Quiz has ended and been cleaned up from Redis, including the lock.")
 
 
 async def main_loop():
-    logger.info("Starting worker main loop...")
+    logger.info("Worker: Starting main loop...")
     while True:
         try:
-            # Using SCAN_ITER for keys method to avoid blocking Redis for large datasets
             active_quiz_keys = [key async for key in redis_handler.redis_client.scan_iter("Quiz:*:*")]
 
             if active_quiz_keys:
-                logger.info(f"Found {len(active_quiz_keys)} quiz keys to process: {active_quiz_keys}")
-                # Using asyncio.gather to run processing concurrently
+                logger.info(f"Worker: Found {len(active_quiz_keys)} quiz keys to process: {active_quiz_keys}")
                 tasks = [process_active_quiz(key) for key in active_quiz_keys]
-                # return_exceptions=True ensures that if one task fails, others still complete
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for i, result in enumerate(results):
                     if isinstance(result, Exception):
-                        logger.error(f"An error occurred while processing quiz {active_quiz_keys[i]}: {result}", exc_info=result)
+                        logger.error(f"Worker: An error occurred while processing quiz {active_quiz_keys[i]}: {result}", exc_info=result)
             else:
-                logger.debug("No active quizzes found. Waiting...")
+                logger.debug("Worker: No active quizzes found. Waiting...")
 
         except Exception as e:
-            logger.error(f"An critical error occurred in the main loop: {e}", exc_info=True)
+            logger.error(f"Worker: An critical error occurred in the main loop: {e}", exc_info=True)
 
-        await asyncio.sleep(1) # Check every 1 second
+        await asyncio.sleep(1)
 
 
 if __name__ == "__main__":
-    # To run this, you must have the project root in your PYTHONPATH.
-    # For example:
-    # $ export PYTHONPATH=$(pwd)
-    # $ python app/worker.py
     try:
         asyncio.run(main_loop())
     except KeyboardInterrupt:
-        logger.info("Worker shutting down gracefully.")
+        logger.info("Worker: Shutting down gracefully.")
     except Exception as e:
-        logger.error(f"Fatal error in worker startup/main: {e}", exc_info=True)
+        logger.error(f"Worker: Fatal error in worker startup/main: {e}", exc_info=True)
