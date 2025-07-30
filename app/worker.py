@@ -209,8 +209,11 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             logger.error(f"Worker: [{quiz_key}] Failed to scan for participants during next_question: {e}", exc_info=True)
             participants = 0 # Default to 0 if Redis fails
 
-        question_text = (
-            f"**السؤال {next_index + 1}**: {question['question']}\n\n"
+        base_question_text = f"**السؤال {next_index + 1}**: {question['question']}"
+
+        # Construct the full text to be sent in the message
+        full_question_text = (
+            f"{base_question_text}\n\n"
             f"👥 **المشاركون**: {participants}"
         )
         options = [question['opt1'], question['opt2'], question['opt3'], question['opt4']]
@@ -220,7 +223,7 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
         message_data = {
             "chat_id": chat_id,
             "message_id": message_id, # This is the original message ID
-            "text": question_text,
+            "text": full_question_text,
             "reply_markup": json.dumps(keyboard),
             "parse_mode": "Markdown"
         }
@@ -244,10 +247,10 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
 
         bot_token = quiz_status.get("bot_token")
         await redis_handler.set_current_question(bot_token, chat_id, next_question_id, end_time)
-        # Save the question text and keyboard for the live display updater
+        # Save the base question text and keyboard for the live display updater
         await redis_handler.redis_client.hset(
             quiz_key, mapping={
-                "current_question_text": question_text,
+                "current_question_text": base_question_text,
                 "current_keyboard": json.dumps(keyboard),
                 "current_index": next_index
             }

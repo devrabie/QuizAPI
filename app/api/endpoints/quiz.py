@@ -45,16 +45,23 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     # Send the first question to get the message_id
     telegram_bot = TelegramBotServiceAsync(request.bot_token)
     first_question = questions[0]
-    question_text = f"**السؤال 1**: {first_question['question']}"
+    # This is the base text that will be stored and reused.
+    base_question_text = f"**السؤال 1**: {first_question['question']}"
     options = [first_question['opt1'], first_question['opt2'], first_question['opt3'], first_question['opt4']]
     keyboard = {
         "inline_keyboard": [
             [{"text": opt, "callback_data": f"answer_{first_question['id']}_{i}"}] for i, opt in enumerate(options)
         ]
     }
+
+    # The initial message includes participant count (0). The countdown is added by the worker.
+    initial_message_text = (
+        f"{base_question_text}\n\n"
+        f"👥 **المشاركون**: 0"
+    )
     message_data = {
         "chat_id": request.channel_id, # This MUST be the correct Telegram channel ID from PHP
-        "text": question_text,
+        "text": initial_message_text,
         "reply_markup": json.dumps(keyboard),
         "parse_mode": "Markdown"
     }
@@ -83,11 +90,11 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         creator_id=creator_id
     )
 
-    # Also save the original question text and keyboard to Redis for the worker to use
+    # Also save the original base question text and keyboard to Redis for the worker to use
     quiz_key = redis_handler.quiz_key(request.bot_token, request.channel_id)
     await redis_handler.redis_client.hset(
         quiz_key, mapping={
-            "current_question_text": question_text,
+            "current_question_text": base_question_text, # Save the base text
             "current_keyboard": json.dumps(keyboard)
         }
     )
