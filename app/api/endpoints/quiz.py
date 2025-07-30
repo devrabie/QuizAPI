@@ -24,13 +24,13 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         logger.warning(f"API: Channel ID '{request.channel_id}' does not look like a valid Telegram channel ID (does not start with -100). This might be a misconfiguration from the bot.")
         # Decide whether to raise an error or proceed with the potentially wrong ID
         # For now, we'll proceed, but the worker will fail if it's truly wrong.
-        # raise HTTPException(status_code=400, detail="Invalid channel ID format. Must be a valid Telegram channel ID (e.g., starts with -100).")
+        raise HTTPException(status_code=400, detail="صيغة معرّف القناة غير صالحة. يجب أن يكون معرّف قناة تيليجرام صالح (مثلًا، يبدأ بـ -100).") # Arabic message
 
     await sqlite_handler.create_tables(request.stats_db_path)
     questions = await sqlite_handler.get_questions(request.questions_db_path, request.total_questions)
     if not questions:
         logger.error(f"API: No questions found in {request.questions_db_path} for total_questions {request.total_questions}")
-        raise HTTPException(status_code=404, detail="No questions found in the database.")
+        raise HTTPException(status_code=404, detail="لم يتم العثور على أي أسئلة في قاعدة البيانات.") # Arabic message
 
     question_ids = [q['id'] for q in questions]
     creator_id = 0 # Placeholder for the user who started the quiz (e.g., admin_id)
@@ -40,7 +40,7 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     current_quiz_status = await redis_handler.get_quiz_status(request.bot_token, request.channel_id)
     if current_quiz_status:
         logger.warning(f"API: Competition already exists for bot {request.bot_token} in channel {request.channel_id}. Status: {current_quiz_status.get('status')}")
-        raise HTTPException(status_code=400, detail="A competition is already active or being processed in this channel.")
+        raise HTTPException(status_code=400, detail="توجد مسابقة نشطة بالفعل أو قيد المعالجة في هذه القناة.") # Arabic message
 
     # Send the first question to get the message_id
     telegram_bot = TelegramBotServiceAsync(request.bot_token)
@@ -67,10 +67,10 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         logger.info(f"API: Telegram send_message response for first question: {sent_message}")
         if not sent_message.get("ok"):
             logger.error(f"API: Failed to send first message to Telegram: {sent_message.get('description')}")
-            raise HTTPException(status_code=500, detail=f"Failed to send first message to Telegram: {sent_message.get('description')}")
+            raise HTTPException(status_code=500, detail=f"فشل في إرسال الرسالة الأولى إلى تيليجرام: {sent_message.get('description')}") # Arabic message
     except Exception as e:
         logger.error(f"API: Error sending first message for quiz: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error sending first message for quiz: {e}")
+        raise HTTPException(status_code=500, detail=f"خطأ أثناء إرسال الرسالة الأولى للمسابقة: {e}") # Arabic message
 
     message_id = sent_message["result"]["message_id"]
     logger.info(f"API: First message sent successfully. Message ID: {message_id}")
@@ -119,14 +119,14 @@ async def stop_competition(request: quiz_models.StopCompetitionRequest):
     # This prevents creating a "ghost" key if the worker already cleaned it up.
     if not await redis_handler.redis_client.exists(quiz_key):
         logger.warning(f"API: Stop request received for competition {quiz_key} that does not exist or has already been cleaned up.")
-        raise HTTPException(status_code=404, detail="No active competition to stop in this channel.")
+        raise HTTPException(status_code=404, detail="لا توجد مسابقة نشطة لإيقافها في هذه القناة.") # Arabic message
 
     quiz_status = await redis_handler.get_quiz_status_by_key(quiz_key)
 
     # Check if the quiz is currently in an 'active' state to be stopped.
     # If it's already "stopping" or "ended", we don't need to try to stop it again.
     if quiz_status.get("status") != "active":
-        detail_msg = f"Competition is not in 'active' state (current state: {quiz_status.get('status')}). Cannot stop it directly via API."
+        detail_msg = f"المسابقة ليست في حالة 'نشطة' (الحالة الحالية: {quiz_status.get('status')}). لا يمكن إيقافها مباشرة عبر الواجهة البرمجية." # Arabic message
         logger.warning(f"API: [{quiz_key}] {detail_msg}")
         raise HTTPException(status_code=400, detail=detail_msg)
 
@@ -148,30 +148,30 @@ async def submit_answer(request: quiz_models.SubmitAnswerRequest):
     if not quiz_status or quiz_status.get("status") != "active":
         # Check if the status is 'stopping'. If so, provide a more specific message.
         if quiz_status and quiz_status.get("status") == "stopping":
-            raise HTTPException(status_code=400, detail="Competition is currently stopping. No new answers are accepted.")
-        raise HTTPException(status_code=400, detail="No active competition or competition is not in active state.")
+            raise HTTPException(status_code=400, detail="المسابقة في طور الإيقاف حاليًا. لا يتم قبول إجابات جديدة.") # Arabic message
+        raise HTTPException(status_code=400, detail="لا توجد مسابقة نشطة أو المسابقة ليست في حالة نشطة.") # Arabic message
 
     # Check if the question ID matches the current active question
     current_question_id_in_redis = int(quiz_time.get("question_id", -1)) if quiz_time and quiz_time.get("question_id") else -1
     if current_question_id_in_redis != request.question_id:
         logger.warning(f"API: User {request.user_id} submitted answer for Q{request.question_id}, but current active is Q{current_question_id_in_redis}. Or quiz_time is missing.")
-        raise HTTPException(status_code=400, detail="This is not the current active question or question has expired.")
+        raise HTTPException(status_code=400, detail="هذا ليس السؤال النشط الحالي أو السؤال قد انتهى وقته.") # Arabic message
 
     # Check if user has already answered this specific question
     if await redis_handler.has_answered(request.bot_token, request.channel_id, request.question_id, request.user_id):
         logger.warning(f"API: User {request.user_id} has already answered question {request.question_id}.")
-        raise HTTPException(status_code=400, detail="User has already answered this question.")
+        raise HTTPException(status_code=400, detail="لقد أجبت على هذا السؤال بالفعل.") # Arabic message
 
     # 1. Fetch correct answer from SQLite
     questions_db_path = quiz_status.get("questions_db_path")
     if not questions_db_path:
         logger.error(f"API: Questions DB path not found in quiz status for {request.bot_token}:{request.channel_id}")
-        raise HTTPException(status_code=500, detail="Quiz configuration error: Questions database path missing.")
+        raise HTTPException(status_code=500, detail="خطأ في تهيئة المسابقة: مسار قاعدة بيانات الأسئلة مفقود.") # Arabic message
 
     question = await sqlite_handler.get_question_by_id(questions_db_path, request.question_id)
     if not question:
         logger.error(f"API: Question {request.question_id} not found in DB {questions_db_path}.")
-        raise HTTPException(status_code=404, detail="Question not found.")
+        raise HTTPException(status_code=404, detail="لم يتم العثور على السؤال.") # Arabic message
 
     correct_option_index = question['correct_opt'] # Assuming 0-indexed from DB
     # Options are opt1, opt2, etc. so we add 1 to the 0-indexed correct_option_index
@@ -246,4 +246,4 @@ async def leaderboard(stats_db_path: str):
 async def cleanup(request: quiz_models.StopCompetitionRequest):
     logger.warning(f"API: Manual cleanup requested for bot {request.bot_token} in channel {request.channel_id}.")
     await redis_handler.end_quiz(request.bot_token, request.channel_id)
-    return {"message": "Redis state cleaned up. Note: Full results calculation and SQLite archiving is handled by the worker's end_quiz."}
+    return {"message": "تم تنظيف حالة Redis. ملاحظة: يتم التعامل مع حساب النتائج الكاملة وأرشفة SQLite بواسطة عامل المعالجة (worker)."} # Arabic message
