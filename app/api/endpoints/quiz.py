@@ -22,8 +22,6 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     # A real Telegram channel_id usually starts with -100
     if not str(request.channel_id).startswith('-100'):
         logger.warning(f"API: Channel ID '{request.channel_id}' does not look like a valid Telegram channel ID (does not start with -100). This might be a misconfiguration from the bot.")
-        # Decide whether to raise an error or proceed with the potentially wrong ID
-        # For now, we'll proceed, but the worker will fail if it's truly wrong.
         raise HTTPException(status_code=400, detail="صيغة معرّف القناة غير صالحة. يجب أن يكون معرّف قناة تيليجرام صالح (مثلًا، يبدأ بـ -100).") # Arabic message
 
     await sqlite_handler.create_tables(request.stats_db_path)
@@ -36,7 +34,6 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     creator_id = 0 # Placeholder for the user who started the quiz (e.g., admin_id)
 
     # Check if a quiz is already active for this bot/chat
-    # This prevents starting a new quiz if ANY state exists, which is safer.
     current_quiz_status = await redis_handler.get_quiz_status(request.bot_token, request.channel_id)
     if current_quiz_status:
         logger.warning(f"API: Competition already exists for bot {request.bot_token} in channel {request.channel_id}. Status: {current_quiz_status.get('status')}")
@@ -45,8 +42,11 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     # Send the first question to get the message_id
     telegram_bot = TelegramBotServiceAsync(request.bot_token)
     first_question = questions[0]
-    # This is the base text that will be stored and reused.
-    base_question_text = f"**السؤال 1**: {first_question['question']}"
+
+    # This is the BASE text of the question (e.g., "**السؤال 1**: ما عاصمة مصر؟")
+    # This part will be saved to Redis as `current_question_text` for dynamic updates.
+    base_question_text_for_redis = f"**السؤال 1**: {first_question['question']}"
+
     options = [first_question['opt1'], first_question['opt2'], first_question['opt3'], first_question['opt4']]
     keyboard = {
         "inline_keyboard": [
@@ -54,10 +54,19 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         ]
     }
 
-    # The initial message only contains the base question. The worker will add dynamic info.
+    # Construct the FULL initial message text that will be SENT to Telegram.
+    # It includes the question, initial participant count (0), and initial time.
+    initial_participants_count = 0
+    initial_time_display = request.question_delay
+    full_initial_message_text = (
+        f"❓ {base_question_text_for_redis}\n\n"
+        f"👥 **المشاركون**: {initial_participants_count}\n"
+        f"⏳ **الوقت المتبقي**: {initial_time_display} ثانية"
+    )
+
     message_data = {
         "chat_id": request.channel_id, # This MUST be the correct Telegram channel ID from PHP
-        "text": base_question_text,
+        "text": full_initial_message_text, # Send the full formatted text from the start
         "reply_markup": json.dumps(keyboard),
         "parse_mode": "Markdown"
     }
@@ -86,11 +95,12 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         creator_id=creator_id
     )
 
-    # Also save the original base question text and keyboard to Redis for the worker to use
+    # Save the original BASE question text (without dynamic info) and keyboard to Redis for the worker to use.
+    # The worker will combine this base text with live stats.
     quiz_key = redis_handler.quiz_key(request.bot_token, request.channel_id)
     await redis_handler.redis_client.hset(
         quiz_key, mapping={
-            "current_question_text": base_question_text, # Save the base text
+            "current_question_text": base_question_text_for_redis, # Store only the base question text
             "current_keyboard": json.dumps(keyboard)
         }
     )
@@ -100,9 +110,6 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     await redis_handler.set_current_question(request.bot_token, request.channel_id, first_question['id'], end_time)
     await redis_handler.redis_client.hset(redis_handler.quiz_key(request.bot_token, request.channel_id), "current_index", 0)
 
-    # `redis_handler.start_quiz` already sets status to "initializing",
-    # and `redis_handler.activate_quiz` sets it to "active".
-    # Ensure this sequence is correct. Your original code calls `activate_quiz` explicitly, keeping it for now.
     await redis_handler.activate_quiz(request.bot_token, request.channel_id)
 
     logger.info(f"API: Competition started successfully for bot {request.bot_token} in channel {request.channel_id}. Quiz state saved to Redis.")
@@ -115,22 +122,17 @@ async def stop_competition(request: quiz_models.StopCompetitionRequest):
 
     quiz_key = redis_handler.quiz_key(request.bot_token, request.channel_id)
 
-    # CRITICAL CHANGE: Check if the quiz key actually exists before trying to modify it.
-    # This prevents creating a "ghost" key if the worker already cleaned it up.
     if not await redis_handler.redis_client.exists(quiz_key):
         logger.warning(f"API: Stop request received for competition {quiz_key} that does not exist or has already been cleaned up.")
         raise HTTPException(status_code=404, detail="لا توجد مسابقة نشطة لإيقافها في هذه القناة.") # Arabic message
 
     quiz_status = await redis_handler.get_quiz_status_by_key(quiz_key)
 
-    # Check if the quiz is currently in an 'active' state to be stopped.
-    # If it's already "stopping" or "ended", we don't need to try to stop it again.
     if quiz_status.get("status") != "active":
         detail_msg = f"المسابقة ليست في حالة 'نشطة' (الحالة الحالية: {quiz_status.get('status')}). لا يمكن إيقافها مباشرة عبر الواجهة البرمجية." # Arabic message
         logger.warning(f"API: [{quiz_key}] {detail_msg}")
         raise HTTPException(status_code=400, detail=detail_msg)
 
-    # If it exists and is active, then safely set its status to "stopping".
     await redis_handler.redis_client.hset(quiz_key, "status", "stopping")
     logger.info(f"API: Competition {quiz_key} set to 'stopping'. Worker will finalize cleanup and results.")
     return {"message": "Competition is being stopped. Results will be posted shortly."}
@@ -146,7 +148,6 @@ async def submit_answer(request: quiz_models.SubmitAnswerRequest):
 
     quiz_status = await redis_handler.get_quiz_status(request.bot_token, request.channel_id)
     if not quiz_status or quiz_status.get("status") != "active":
-        # Check if the status is 'stopping'. If so, provide a more specific message.
         if quiz_status and quiz_status.get("status") == "stopping":
             raise HTTPException(status_code=400, detail="المسابقة في طور الإيقاف حاليًا. لا يتم قبول إجابات جديدة.") # Arabic message
         raise HTTPException(status_code=400, detail="لا توجد مسابقة نشطة أو المسابقة ليست في حالة نشطة.") # Arabic message
@@ -222,7 +223,6 @@ async def competition_status(bot_token: str, channel_id: str):
 
 
     # Calculate number of participants
-    # Using SCAN_ITER for robustness with many keys
     participant_keys = [key async for key in redis_handler.redis_client.scan_iter(f"QuizAnswers:{bot_token}:{channel_id}:*")]
     participants = len(participant_keys)
 

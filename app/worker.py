@@ -5,7 +5,6 @@ import logging
 import os
 
 # Set up detailed logging
-# To see DEBUG messages, set level to logging.DEBUG
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -57,10 +56,12 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
     bot_token = quiz_status.get("bot_token")
     chat_id = quiz_status.get("chat_id")
     message_id = int(quiz_status.get("message_id"))
-    original_question_text = quiz_status.get("current_question_text", "")
+    # Retrieve the base question text (e.g., "**السؤال 1**: ما عاصمة مصر؟")
+    # This is the text *without* participants or time, which the worker will add dynamically.
+    base_question_text_from_redis = quiz_status.get("current_question_text", "")
 
-    if not all([bot_token, chat_id, message_id, original_question_text]):
-        logger.warning(f"Worker: [{quiz_key}] Missing data needed to update display (token, chat, msg_id, or question_text). Skipping.")
+    if not all([bot_token, chat_id, message_id, base_question_text_from_redis]):
+        logger.warning(f"Worker: [{quiz_key}] Missing data needed to update display (token, chat, msg_id, or base_question_text). Skipping.")
         return
 
     # Get participant count by scanning answer keys
@@ -69,18 +70,15 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
         participants = len(participant_keys)
     except Exception as e:
         logger.error(f"Worker: [{quiz_key}] Failed to scan for participants: {e}", exc_info=True)
-        return # Cannot proceed without participant count
+        return
 
-    # Construct the new text for the message
+        # Construct the new text for the message, combining the base question text with live data
     new_text = (
-        f"{original_question_text}\n\n"
+        f"❓ {base_question_text_from_redis}\n\n"
         f"👥 **المشاركون**: {participants}\n"
         f"⏳ **الوقت المتبقي**: {int(time_left)} ثانية"
     )
 
-    # To edit the message, we also need to provide the same reply_markup (the keyboard).
-    # We reconstruct it here. This is a bit inefficient but necessary.
-    # A better long-term solution might be to store the keyboard in Redis as well.
     current_keyboard_str = quiz_status.get("current_keyboard")
     if not current_keyboard_str:
         logger.warning(f"Worker: [{quiz_key}] 'current_keyboard' not found in status. Cannot update message without it.")
@@ -90,19 +88,16 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
         "chat_id": chat_id,
         "message_id": message_id,
         "text": new_text,
-        "reply_markup": current_keyboard_str, # Use the stored keyboard
+        "reply_markup": current_keyboard_str,
         "parse_mode": "Markdown"
     }
 
     try:
-        # Use asyncio.wait_for for timeout, which is compatible with older Python versions
         response = await asyncio.wait_for(telegram_bot.edit_message(message_data), timeout=10.0)
 
         if not response.get("ok"):
-            # This handles cases where Telegram accepts the request but can't fulfill it
-            # e.g., "message is not modified"
             if "message is not modified" not in response.get("description", ""):
-                 logger.error(f"Worker: [{quiz_key}] Telegram reported failure to update display: {response.get('description')}")
+                logger.error(f"Worker: [{quiz_key}] Telegram reported failure to update display: {response.get('description')}")
         else:
             logger.debug(f"Worker: [{quiz_key}] Successfully updated display message.")
     except asyncio.TimeoutError:
@@ -119,7 +114,6 @@ async def process_active_quiz(quiz_key: str):
         logger.warning(f"Worker: [{quiz_key}] No status found in Redis. It might have been cleaned up. Skipping.")
         return
 
-    # If the status is "stopping", let end_quiz handle it, but prevent loops.
     if quiz_status.get("status") == "stopping":
         logger.info(f"Worker: [{quiz_key}] Found in 'stopping' state. Attempting to finalize.")
         bot_token = quiz_status.get("bot_token")
@@ -134,14 +128,12 @@ async def process_active_quiz(quiz_key: str):
         return
 
     bot_token = quiz_status.get("bot_token")
-    chat_id = quiz_status.get("chat_id") # Extract chat_id from the key
+    chat_id = quiz_status.get("chat_id")
     if not bot_token:
         logger.error(f"Worker: [{quiz_key}] Bot token not found in status. Cleaning up broken state.")
-        # Perform emergency cleanup by deleting the main quiz key
         await redis_handler.redis_client.delete(quiz_key)
         return
 
-    # chat_id = quiz_key.split(":")[2] # Extract chat_id from the key
     telegram_bot = get_telegram_bot(bot_token)
     quiz_time_key = redis_handler.quiz_time_key(bot_token, chat_id)
     quiz_time = await redis_handler.redis_client.hgetall(quiz_time_key)
@@ -202,17 +194,30 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             await end_quiz(quiz_key, quiz_status, telegram_bot)
             return
 
-        # Only the base question text is sent. The worker will add dynamic info.
-        base_question_text = f"**السؤال {next_index + 1}**: {question['question']}"
+        # Base text for the new question (e.g., "**السؤال 2**: ما أكبر محيط؟")
+        # This part will be saved to Redis as `current_question_text` for dynamic updates.
+        base_question_text_for_redis = f"**السؤال {next_index + 1}**: {question['question']}"
+
         options = [question['opt1'], question['opt2'], question['opt3'], question['opt4']]
         keyboard = {"inline_keyboard": [[{"text": opt, "callback_data": f"answer_{next_question_id}_{i}"}] for i, opt in enumerate(options)]}
+
+        # Construct the FULL message text for the new question with initial dynamic info.
+        # This is what will be sent to Telegram. Initial participants will be 0 for a fresh question.
+        time_per_question = int(quiz_status.get("time_per_question", 30))
+        initial_participants_count_for_new_q = 0
+        initial_time_display_for_new_q = time_per_question # Show full time for the new question
+        full_new_question_message_text = (
+            f"❓ {base_question_text_for_redis}\n\n"
+            f"👥 **المشاركون**: {initial_participants_count_for_new_q}\n"
+            f"⏳ **الوقت المتبقي**: {initial_time_display_for_new_q} ثانية"
+        )
 
         chat_id = quiz_status.get("chat_id")
         message_id = int(quiz_status.get("message_id")) # message_id is retrieved from Redis
         message_data = {
             "chat_id": chat_id,
-            "message_id": message_id, # This is the original message ID
-            "text": base_question_text, # Send only the base text
+            "message_id": message_id,
+            "text": full_new_question_message_text, # Send the full formatted text
             "reply_markup": json.dumps(keyboard),
             "parse_mode": "Markdown"
         }
@@ -231,23 +236,21 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             await end_quiz(quiz_key, quiz_status, telegram_bot)
             return
 
-        time_per_question = int(quiz_status.get("time_per_question", 30))
         end_time = datetime.now() + timedelta(seconds=time_per_question)
 
         bot_token = quiz_status.get("bot_token")
         await redis_handler.set_current_question(bot_token, chat_id, next_question_id, end_time)
-        # Save the base question text and keyboard for the live display updater
+        # Save the BASE question text (without dynamic info) and keyboard to Redis.
         await redis_handler.redis_client.hset(
             quiz_key, mapping={
-                "current_question_text": base_question_text,
+                "current_question_text": base_question_text_for_redis,
                 "current_keyboard": json.dumps(keyboard),
                 "current_index": next_index
             }
         )
 
-        # Immediately call the display updater to add dynamic info
+        # Immediately call the display updater to add dynamic info (participants, countdown)
         logger.info(f"Worker: [{quiz_key}] Performing initial display update for new question.")
-        # We need to refresh quiz_status to get the latest keyboard and text we just set
         refreshed_quiz_status = await redis_handler.get_quiz_status_by_key(quiz_key)
         await update_question_display(quiz_key, refreshed_quiz_status, telegram_bot, time_per_question, force_update=True)
 
@@ -273,7 +276,6 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
         await redis_handler.redis_client.delete(lock_key)
         return
 
-    # chat_id = quiz_key.split(":")[2]
     chat_id =  quiz_status.get("chat_id")
     message_id = int(quiz_status.get("message_id")) # message_id is retrieved from quiz_status
     stats_db_path = quiz_status.get("stats_db_path")
@@ -327,14 +329,18 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
     if winner_id:
         results_text += f"🎉 **الفائز**: {winner_username} بـ {winner_score} نقطة!\n\n"
     else:
-        results_text += "لم يشارك أحد في المسابقة أو لم يحصل أحد على نقاط.\n\n"
+        results_text += "😞 لم يشارك أحد في المسابقة أو لم يحصل أحد على نقاط.\n\n" # Emoji for no participants
 
     if len(sorted_participants) > 0:
         results_text += "🏅 **لوحة المتصدرين:**\n"
         for i, (user_id, data) in enumerate(sorted_participants[:10]):
-            results_text += f"{i+1}. {data['username']}: {data['score']} نقطة\n"
+            rank_emoji = ""
+            if i == 0: rank_emoji = "🥇 "
+            elif i == 1: rank_emoji = "🥈 "
+            elif i == 2: rank_emoji = "🥉 "
+            results_text += f"{rank_emoji}{i+1}. {data['username']}: {data['score']} نقطة\n"
     else:
-        results_text += "لا توجد نتائج لعرضها.\n"
+        results_text += "😔 لا توجد نتائج لعرضها.\n" # Emoji for no results
 
     try:
         logger.info(f"Worker: [{quiz_key}] Saving quiz history and updating user stats in SQLite DB: {stats_db_path}")
