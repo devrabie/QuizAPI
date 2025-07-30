@@ -54,14 +54,10 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         ]
     }
 
-    # The initial message includes participant count (0). The countdown is added by the worker.
-    initial_message_text = (
-        f"{base_question_text}\n\n"
-        f"👥 **المشاركون**: 0"
-    )
+    # The initial message only contains the base question. The worker will add dynamic info.
     message_data = {
         "chat_id": request.channel_id, # This MUST be the correct Telegram channel ID from PHP
-        "text": initial_message_text,
+        "text": base_question_text,
         "reply_markup": json.dumps(keyboard),
         "parse_mode": "Markdown"
     }

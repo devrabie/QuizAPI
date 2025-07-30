@@ -199,31 +199,17 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             await end_quiz(quiz_key, quiz_status, telegram_bot)
             return
 
-        # Get participant count to include it in the initial question post
-        bot_token = quiz_status.get("bot_token")
-        chat_id = quiz_status.get("chat_id")
-        try:
-            participant_keys = [key async for key in redis_handler.redis_client.scan_iter(f"QuizAnswers:{bot_token}:{chat_id}:*")]
-            participants = len(participant_keys)
-        except Exception as e:
-            logger.error(f"Worker: [{quiz_key}] Failed to scan for participants during next_question: {e}", exc_info=True)
-            participants = 0 # Default to 0 if Redis fails
-
+        # Only the base question text is sent. The worker will add dynamic info.
         base_question_text = f"**السؤال {next_index + 1}**: {question['question']}"
-
-        # Construct the full text to be sent in the message
-        full_question_text = (
-            f"{base_question_text}\n\n"
-            f"👥 **المشاركون**: {participants}"
-        )
         options = [question['opt1'], question['opt2'], question['opt3'], question['opt4']]
         keyboard = {"inline_keyboard": [[{"text": opt, "callback_data": f"answer_{next_question_id}_{i}"}] for i, opt in enumerate(options)]}
 
+        chat_id = quiz_status.get("chat_id")
         message_id = int(quiz_status.get("message_id")) # message_id is retrieved from Redis
         message_data = {
             "chat_id": chat_id,
             "message_id": message_id, # This is the original message ID
-            "text": full_question_text,
+            "text": base_question_text, # Send only the base text
             "reply_markup": json.dumps(keyboard),
             "parse_mode": "Markdown"
         }
