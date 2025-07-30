@@ -30,26 +30,29 @@ def get_telegram_bot(token: str) -> TelegramBotServiceAsync:
         bot_instances[token] = TelegramBotServiceAsync(token)
     return bot_instances[token]
 
-async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotServiceAsync, time_left: float):
+async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotServiceAsync, time_left: float, force_update: bool = False):
     """
     Updates the Telegram message with the current participant count and time left.
-    Includes a rate-limiting check to avoid hitting API limits.
+    Includes a rate-limiting check to avoid hitting API limits, which can be bypassed with force_update.
     """
     UPDATE_INTERVAL_SECONDS = 5  # Update every 5 seconds
     now = datetime.now()
 
-    # Rate limiting check
-    last_update_str = await redis_handler.redis_client.hget(quiz_key, "last_display_update")
-    if last_update_str:
-        try:
-            last_update_time = datetime.fromisoformat(last_update_str)
-            if (now - last_update_time).total_seconds() < UPDATE_INTERVAL_SECONDS:
-                return  # Not time to update yet
-        except ValueError:
-            logger.warning(f"Worker: [{quiz_key}] Could not parse last_display_update timestamp: {last_update_str}")
+    if not force_update:
+        # Rate limiting check
+        last_update_str = await redis_handler.redis_client.hget(quiz_key, "last_display_update")
+        if last_update_str:
+            try:
+                last_update_time = datetime.fromisoformat(last_update_str)
+                if (now - last_update_time).total_seconds() < UPDATE_INTERVAL_SECONDS:
+                    logger.debug(f"Worker: [{quiz_key}] Display update skipped due to rate limiting.")
+                    return  # Not time to update yet
+            except ValueError:
+                logger.warning(f"Worker: [{quiz_key}] Could not parse last_display_update timestamp: {last_update_str}")
 
     # Proceed with update and set new timestamp
     await redis_handler.redis_client.hset(quiz_key, "last_display_update", now.isoformat())
+    logger.info(f"Worker: [{quiz_key}] Proceeding with display update (force_update={force_update}).")
 
     bot_token = quiz_status.get("bot_token")
     chat_id = quiz_status.get("chat_id")
@@ -241,6 +244,13 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
                 "current_index": next_index
             }
         )
+
+        # Immediately call the display updater to add dynamic info
+        logger.info(f"Worker: [{quiz_key}] Performing initial display update for new question.")
+        # We need to refresh quiz_status to get the latest keyboard and text we just set
+        refreshed_quiz_status = await redis_handler.get_quiz_status_by_key(quiz_key)
+        await update_question_display(quiz_key, refreshed_quiz_status, telegram_bot, time_per_question, force_update=True)
+
         logger.info(f"Worker: [{quiz_key}] State updated. New current_index: {next_index}. Timer set for {time_per_question}s.")
 
     else:
