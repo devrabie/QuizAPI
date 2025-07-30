@@ -95,9 +95,9 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
     }
 
     try:
-        # Use a short timeout to prevent the worker from getting stuck on a bad network call
-        async with asyncio.timeout(10):
-            response = await telegram_bot.edit_message(message_data)
+        # Use asyncio.wait_for for timeout, which is compatible with older Python versions
+        response = await asyncio.wait_for(telegram_bot.edit_message(message_data), timeout=10.0)
+
         if not response.get("ok"):
             # This handles cases where Telegram accepts the request but can't fulfill it
             # e.g., "message is not modified"
@@ -108,7 +108,7 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
     except asyncio.TimeoutError:
         logger.warning(f"Worker: [{quiz_key}] Timed out while trying to update display message.")
     except Exception as e:
-        logger.error(f"Worker: [{quiz_key}] Failed to update display message due to an exception: {e}", exc_info=False)
+        logger.error(f"Worker: [{quiz_key}] Failed to update display message due to an exception: {e}", exc_info=True)
 
 
 async def process_active_quiz(quiz_key: str):
