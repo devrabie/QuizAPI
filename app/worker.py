@@ -30,6 +30,84 @@ def get_telegram_bot(token: str) -> TelegramBotServiceAsync:
         bot_instances[token] = TelegramBotServiceAsync(token)
     return bot_instances[token]
 
+async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotServiceAsync, time_left: float):
+    """
+    Updates the Telegram message with the current participant count and time left.
+    Includes a rate-limiting check to avoid hitting API limits.
+    """
+    UPDATE_INTERVAL_SECONDS = 5  # Update every 5 seconds
+    now = datetime.now()
+
+    # Rate limiting check
+    last_update_str = await redis_handler.redis_client.hget(quiz_key, "last_display_update")
+    if last_update_str:
+        try:
+            last_update_time = datetime.fromisoformat(last_update_str)
+            if (now - last_update_time).total_seconds() < UPDATE_INTERVAL_SECONDS:
+                return  # Not time to update yet
+        except ValueError:
+            logger.warning(f"Worker: [{quiz_key}] Could not parse last_display_update timestamp: {last_update_str}")
+
+    # Proceed with update and set new timestamp
+    await redis_handler.redis_client.hset(quiz_key, "last_display_update", now.isoformat())
+
+    bot_token = quiz_status.get("bot_token")
+    chat_id = quiz_status.get("chat_id")
+    message_id = int(quiz_status.get("message_id"))
+    original_question_text = quiz_status.get("current_question_text", "")
+
+    if not all([bot_token, chat_id, message_id, original_question_text]):
+        logger.warning(f"Worker: [{quiz_key}] Missing data needed to update display (token, chat, msg_id, or question_text). Skipping.")
+        return
+
+    # Get participant count by scanning answer keys
+    try:
+        participant_keys = [key async for key in redis_handler.redis_client.scan_iter(f"QuizAnswers:{bot_token}:{chat_id}:*")]
+        participants = len(participant_keys)
+    except Exception as e:
+        logger.error(f"Worker: [{quiz_key}] Failed to scan for participants: {e}", exc_info=True)
+        return # Cannot proceed without participant count
+
+    # Construct the new text for the message
+    new_text = (
+        f"{original_question_text}\n\n"
+        f"👥 **المشاركون**: {participants}\n"
+        f"⏳ **الوقت المتبقي**: {int(time_left)} ثانية"
+    )
+
+    # To edit the message, we also need to provide the same reply_markup (the keyboard).
+    # We reconstruct it here. This is a bit inefficient but necessary.
+    # A better long-term solution might be to store the keyboard in Redis as well.
+    current_keyboard_str = quiz_status.get("current_keyboard")
+    if not current_keyboard_str:
+        logger.warning(f"Worker: [{quiz_key}] 'current_keyboard' not found in status. Cannot update message without it.")
+        return
+
+    message_data = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": new_text,
+        "reply_markup": current_keyboard_str, # Use the stored keyboard
+        "parse_mode": "Markdown"
+    }
+
+    try:
+        # Use a short timeout to prevent the worker from getting stuck on a bad network call
+        async with asyncio.timeout(10):
+            response = await telegram_bot.edit_message(message_data)
+        if not response.get("ok"):
+            # This handles cases where Telegram accepts the request but can't fulfill it
+            # e.g., "message is not modified"
+            if "message is not modified" not in response.get("description", ""):
+                 logger.error(f"Worker: [{quiz_key}] Telegram reported failure to update display: {response.get('description')}")
+        else:
+            logger.debug(f"Worker: [{quiz_key}] Successfully updated display message.")
+    except asyncio.TimeoutError:
+        logger.warning(f"Worker: [{quiz_key}] Timed out while trying to update display message.")
+    except Exception as e:
+        logger.error(f"Worker: [{quiz_key}] Failed to update display message due to an exception: {e}", exc_info=False)
+
+
 async def process_active_quiz(quiz_key: str):
     logger.info(f"Worker: Processing quiz key: {quiz_key}")
     quiz_status = await redis_handler.get_quiz_status_by_key(quiz_key)
@@ -77,7 +155,9 @@ async def process_active_quiz(quiz_key: str):
                 should_process_next_question = True
             else:
                 time_left = (end_time - datetime.now()).total_seconds()
-                logger.debug(f"Worker: [{quiz_key}] Timer active. {time_left:.1f}s left. Waiting.")
+                logger.debug(f"Worker: [{quiz_key}] Timer active. {time_left:.1f}s left. Calling display updater.")
+                # If timer is still active, update the display with countdown/participant info
+                await update_question_display(quiz_key, quiz_status, telegram_bot, time_left)
                 return
         except (ValueError, TypeError):
             logger.error(f"Worker: [{quiz_key}] Invalid end_time format: {quiz_time.get('end')}. Forcing next question.")
@@ -119,11 +199,23 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             await end_quiz(quiz_key, quiz_status, telegram_bot)
             return
 
-        question_text = f"**السؤال {next_index + 1}**: {question['question']}"
+        # Get participant count to include it in the initial question post
+        bot_token = quiz_status.get("bot_token")
+        chat_id = quiz_status.get("chat_id")
+        try:
+            participant_keys = [key async for key in redis_handler.redis_client.scan_iter(f"QuizAnswers:{bot_token}:{chat_id}:*")]
+            participants = len(participant_keys)
+        except Exception as e:
+            logger.error(f"Worker: [{quiz_key}] Failed to scan for participants during next_question: {e}", exc_info=True)
+            participants = 0 # Default to 0 if Redis fails
+
+        question_text = (
+            f"**السؤال {next_index + 1}**: {question['question']}\n\n"
+            f"👥 **المشاركون**: {participants}"
+        )
         options = [question['opt1'], question['opt2'], question['opt3'], question['opt4']]
         keyboard = {"inline_keyboard": [[{"text": opt, "callback_data": f"answer_{next_question_id}_{i}"}] for i, opt in enumerate(options)]}
 
-        chat_id =  quiz_status.get("chat_id")# Ensure this extracts the CORRECT chat_id
         message_id = int(quiz_status.get("message_id")) # message_id is retrieved from Redis
         message_data = {
             "chat_id": chat_id,
@@ -152,7 +244,14 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
 
         bot_token = quiz_status.get("bot_token")
         await redis_handler.set_current_question(bot_token, chat_id, next_question_id, end_time)
-        await redis_handler.redis_client.hset(quiz_key, "current_index", next_index)
+        # Save the question text and keyboard for the live display updater
+        await redis_handler.redis_client.hset(
+            quiz_key, mapping={
+                "current_question_text": question_text,
+                "current_keyboard": json.dumps(keyboard),
+                "current_index": next_index
+            }
+        )
         logger.info(f"Worker: [{quiz_key}] State updated. New current_index: {next_index}. Timer set for {time_per_question}s.")
 
     else:

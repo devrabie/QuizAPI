@@ -83,6 +83,15 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         creator_id=creator_id
     )
 
+    # Also save the original question text and keyboard to Redis for the worker to use
+    quiz_key = redis_handler.quiz_key(request.bot_token, request.channel_id)
+    await redis_handler.redis_client.hset(
+        quiz_key, mapping={
+            "current_question_text": question_text,
+            "current_keyboard": json.dumps(keyboard)
+        }
+    )
+
     # Set the first question's timing information
     end_time = datetime.now() + timedelta(seconds=request.question_delay)
     await redis_handler.set_current_question(request.bot_token, request.channel_id, first_question['id'], end_time)
@@ -162,6 +171,8 @@ async def submit_answer(request: quiz_models.SubmitAnswerRequest):
         raise HTTPException(status_code=404, detail="Question not found.")
 
     correct_option_index = question['correct_opt'] # Assuming 0-indexed from DB
+    # Options are opt1, opt2, etc. so we add 1 to the 0-indexed correct_option_index
+    correct_answer_text = question[f"opt{correct_option_index + 1}"]
 
     score = 0
     correct = False
@@ -185,7 +196,7 @@ async def submit_answer(request: quiz_models.SubmitAnswerRequest):
         time_per_question=time_per_question
     )
 
-    return {"message": "Answer submitted.", "correct": correct, "score": score}
+    return {"message": "Answer submitted.", "correct": correct, "score": score, "correct_answer_text": correct_answer_text}
 
 
 @router.get("/competition_status", response_model=quiz_models.CompetitionStatusResponse)
