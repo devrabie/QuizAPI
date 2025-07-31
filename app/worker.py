@@ -44,8 +44,7 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
     logger.info(f"Worker: [{quiz_key}] Proceeding with display update (force_update={force_update}).")
 
     bot_token = quiz_status.get("bot_token")
-    # Fetch identifier and message IDs from quiz_status
-    quiz_identifier = quiz_status.get("quiz_identifier") # This is the quiz_game_id
+    quiz_identifier = quiz_status.get("quiz_identifier")
     inline_message_id = quiz_status.get("inline_message_id")
     chat_id = quiz_status.get("chat_id")
     message_id = quiz_status.get("message_id")
@@ -77,7 +76,6 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
         logger.warning(f"Worker: [{quiz_key}] 'current_keyboard' not found in status. Cannot update message without it.")
         return
 
-    # Prepare message data for either inline or regular message editing
     message_data = {
         "text": new_text,
         "reply_markup": current_keyboard_str,
@@ -102,6 +100,26 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
                 logger.error(f"Worker: [{quiz_key}] Telegram reported failure to update display: {response.get('description')}")
         else:
             logger.debug(f"Worker: [{quiz_key}] Successfully updated display message.")
+
+        # --- الجزء المُضاف/المُعدَّل هنا: تحديث معرفات الرسالة في Redis بعد كل تحديث للرسالة ---
+        # تحديث inline_message_id أو chat_id/message_id في Redis إذا تغيرت
+        if response.get("result"):
+            updated_inline_message_id = response["result"].get("inline_message_id")
+            updated_chat_id = response["result"].get("chat", {}).get("id")
+            updated_message_id = response["result"].get("message_id")
+
+            # Update Redis with the potentially new/confirmed message identifiers
+            if updated_inline_message_id and quiz_status.get("inline_message_id") != updated_inline_message_id:
+                await redis_handler.redis_client.hset(quiz_key, "inline_message_id", updated_inline_message_id)
+                logger.debug(f"Worker: [{quiz_key}] Updated inline_message_id in Redis: {updated_inline_message_id}")
+            elif updated_chat_id and updated_message_id:
+                # فقط إذا تغيرت، أو إذا كانت غير موجودة أصلاً (الحالة الأولية)
+                if quiz_status.get("chat_id") != str(updated_chat_id) or quiz_status.get("message_id") != str(updated_message_id):
+                    await redis_handler.redis_client.hset(quiz_key, "chat_id", str(updated_chat_id))
+                    await redis_handler.redis_client.hset(quiz_key, "message_id", str(updated_message_id))
+                    logger.debug(f"Worker: [{quiz_key}] Updated chat_id/message_id in Redis: {updated_chat_id}/{updated_message_id}")
+        # --- نهاية الجزء المُضاف/المُعدَّل ---
+
     except asyncio.TimeoutError:
         logger.warning(f"Worker: [{quiz_key}] Timed out while trying to update display message.")
     except Exception as e:
@@ -119,19 +137,20 @@ async def process_active_quiz(quiz_key: str):
     if quiz_status.get("status") == "stopping":
         logger.info(f"Worker: [{quiz_key}] Found in 'stopping' state. Attempting to finalize.")
         bot_token = quiz_status.get("bot_token")
-        quiz_identifier = quiz_status.get("quiz_identifier") # Get identifier for end_quiz
+        quiz_identifier = quiz_status.get("quiz_identifier")
         if bot_token and quiz_identifier:
             await end_quiz(quiz_key, quiz_status, get_telegram_bot(bot_token))
         else:
             logger.error(f"Worker: [{quiz_key}] Cannot finalize 'stopping' quiz, bot_token or quiz_identifier is missing.")
         return
 
-    if quiz_status.get("status") != "active":
-        logger.info(f"Worker: [{quiz_key}] Status is not 'active' (it's '{quiz_status.get('status')}'). Skipping question progression.")
+    # تم تغيير هذا الشرط للسماح بالانتقال من 'initializing' إلى 'active'
+    if quiz_status.get("status") not in ["active", "initializing"]:
+        logger.info(f"Worker: [{quiz_key}] Status is not 'active' or 'initializing' (it's '{quiz_status.get('status')}'). Skipping question progression.")
         return
 
     bot_token = quiz_status.get("bot_token")
-    quiz_identifier = quiz_status.get("quiz_identifier") # Use quiz_identifier
+    quiz_identifier = quiz_status.get("quiz_identifier")
     if not bot_token or not quiz_identifier:
         logger.error(f"Worker: [{quiz_key}] Bot token or quiz_identifier not found in status. Cleaning up broken state.")
         await redis_handler.redis_client.delete(quiz_key)
@@ -199,17 +218,10 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
         base_question_text_for_redis = f"**السؤال {next_index + 1}**: {question['question']}"
 
         options = [question['opt1'], question['opt2'], question['opt3'], question['opt4']]
-        # Important: Include quiz_identifier in callback data for answers for robust tracking
-        # This assumes quiz_game_id is used as quiz_identifier
-        quiz_identifier_for_callbacks = quiz_status.get("quiz_identifier")
         keyboard = {"inline_keyboard": [[{"text": opt, "callback_data": f"answer_{next_question_id}_{i}"}] for i, opt in enumerate(options)]}
-        # The above callback data currently does not include quiz_identifier. It should ideally be:
-        # [{"text": opt, "callback_data": f"answer_{quiz_identifier_for_callbacks}_{next_question_id}_{i}"}]
-        # This change needs to be propagated to the PHP CallbackqueryCommand's `handleQuizAnswer` as well.
-        # For now, it will use the scanning logic, but direct passing is better.
 
         time_per_question = int(quiz_status.get("time_per_question", 30))
-        initial_participants_count_for_new_q = 0 # This will be updated by update_question_display
+        initial_participants_count_for_new_q = 0
         initial_time_display_for_new_q = time_per_question
         full_new_question_message_text = (
             f"❓ {base_question_text_for_redis}\n\n"
@@ -217,12 +229,10 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             f"⏳ **الوقت المتبقي**: {initial_time_display_for_new_q} ثانية"
         )
 
-        # Retrieve message identifiers from quiz_status
         inline_message_id = quiz_status.get("inline_message_id")
         chat_id = quiz_status.get("chat_id")
         message_id = quiz_status.get("message_id")
 
-        # Prepare message data for editing
         message_data = {
             "text": full_new_question_message_text,
             "reply_markup": json.dumps(keyboard),
@@ -250,10 +260,27 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
                 await end_quiz(quiz_key, quiz_status, telegram_bot)
                 return
             logger.info(f"Worker: [{quiz_key}] Question {next_index + 1} (ID: {next_question_id}) sent/edited successfully.")
+
+            # --- الجزء المُضاف/المُعدَّل هنا: تحديث معرفات الرسالة في Redis بعد كل تحديث للرسالة ---
+            if response.get("result"):
+                updated_inline_message_id = response["result"].get("inline_message_id")
+                updated_chat_id = response["result"].get("chat", {}).get("id")
+                updated_message_id = response["result"].get("message_id")
+
+                if updated_inline_message_id and quiz_status.get("inline_message_id") != updated_inline_message_id:
+                    await redis_handler.redis_client.hset(quiz_key, "inline_message_id", updated_inline_message_id)
+                    logger.debug(f"Worker: [{quiz_key}] Updated inline_message_id in Redis: {updated_inline_message_id}")
+                elif updated_chat_id and updated_message_id:
+                    if quiz_status.get("chat_id") != str(updated_chat_id) or quiz_status.get("message_id") != str(updated_message_id):
+                        await redis_handler.redis_client.hset(quiz_key, "chat_id", str(updated_chat_id))
+                        await redis_handler.redis_client.hset(quiz_key, "message_id", str(updated_message_id))
+                        logger.debug(f"Worker: [{quiz_key}] Updated chat_id/message_id in Redis: {updated_chat_id}/{updated_message_id}")
+            # --- نهاية الجزء المُضاف/المُعدَّل ---
+
+        except asyncio.TimeoutError:
+            logger.warning(f"Worker: [{quiz_key}] Timed out while trying to update display message.")
         except Exception as e:
-            logger.error(f"Worker: [{quiz_key}] Exception while editing message: {e}", exc_info=True)
-            await end_quiz(quiz_key, quiz_status, telegram_bot)
-            return
+            logger.error(f"Worker: [{quiz_key}] Failed to update display message due to an exception: {e}", exc_info=True)
 
         end_time = datetime.now() + timedelta(seconds=time_per_question)
 
@@ -295,8 +322,8 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
         return
 
     inline_message_id = quiz_status.get("inline_message_id")
-    chat_id = quiz_status.get("chat_id") # Use existing chat_id from quiz_status (if regular quiz)
-    message_id = quiz_status.get("message_id") # Use existing message_id from quiz_status (if regular quiz)
+    chat_id = quiz_status.get("chat_id")
+    message_id = quiz_status.get("message_id")
     stats_db_path = quiz_status.get("stats_db_path")
 
     if not stats_db_path:
@@ -369,7 +396,6 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
 
     try:
         logger.info(f"Worker: [{quiz_key}] Saving quiz history and updating user stats in SQLite DB: {stats_db_path}")
-        # Note: quiz_identifier is used as chat_id in quiz_history, might need to distinguish if real chat_id is ever needed here.
         quiz_history_id = await sqlite_handler.save_quiz_history(stats_db_path, quiz_identifier, total_questions, winner_id, winner_score)
 
         for user_id, data in final_scores.items():
@@ -408,7 +434,6 @@ async def main_loop():
     logger.info("Worker: Starting main loop...")
     while True:
         try:
-            # Scan for both regular and inline quiz keys
             active_quiz_keys = [key async for key in redis_handler.redis_client.scan_iter("Quiz:*:*")]
 
             if active_quiz_keys:
