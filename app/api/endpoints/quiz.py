@@ -32,10 +32,21 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
 
     # Check if a quiz is already active for this bot/identifier
     # Use the new quiz_unique_id
+    # current_quiz_status = await redis_handler.get_quiz_status(request.bot_token, quiz_unique_id)
+    # if current_quiz_status and current_quiz_status.get("status") in ["active", "starting", "initializing"]:
+    #     logger.warning(f"API: Competition already exists for bot {request.bot_token} with identifier {quiz_unique_id}. Status: {current_quiz_status.get('status')}")
+  # /      raise HTTPException(status_code=400, detail="توجد مسابقة نشطة بالفعل أو قيد المعالجة بهذا المعرّف.")
     current_quiz_status = await redis_handler.get_quiz_status(request.bot_token, quiz_unique_id)
-    if current_quiz_status and current_quiz_status.get("status") in ["active", "starting", "initializing"]:
-        logger.warning(f"API: Competition already exists for bot {request.bot_token} with identifier {quiz_unique_id}. Status: {current_quiz_status.get('status')}")
-        raise HTTPException(status_code=400, detail="توجد مسابقة نشطة بالفعل أو قيد المعالجة بهذا المعرّف.")
+    if not current_quiz_status:
+        # If the quiz key doesn't exist, it means it's gone or was never created properly.
+        logger.error(f"API: Start request for non-existent quiz {quiz_unique_id}.")
+        raise HTTPException(status_code=404, detail="المسابقة غير موجودة أو انتهت صلاحيتها. يرجى إنشاء مسابقة جديدة.")
+
+    # Only allow starting if the quiz is in a 'pending' state.
+    # If it's 'active', 'initializing', or 'stopping', it's not pending.
+    if current_quiz_status.get("status") != "pending":
+        logger.warning(f"API: Competition start request for {quiz_unique_id} rejected. Current status: {current_quiz_status.get('status')}. Expected 'pending'.")
+        raise HTTPException(status_code=400, detail=f"المسابقة ليست في حالة انتظار (pending). حالتها الحالية: {current_quiz_status.get('status')}.")
 
     telegram_bot = TelegramBotServiceAsync(request.bot_token)
     first_question = questions[0]
