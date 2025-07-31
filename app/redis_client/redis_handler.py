@@ -12,32 +12,26 @@ REDIS_DB = int(0)
 
 redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
 
-# Modified to use quiz_unique_id instead of chat_id
 def quiz_key(bot_token: str, quiz_unique_id: str) -> str:
     return f"Quiz:{bot_token}:{quiz_unique_id}"
 
-# Modified to use quiz_unique_id instead of chat_id
 def quiz_answers_key(bot_token: str, quiz_unique_id: str, user_id: int) -> str:
     return f"QuizAnswers:{bot_token}:{quiz_unique_id}:{user_id}"
 
-# Modified to use quiz_unique_id instead of chat_id
 def quiz_results_key(bot_token: str, quiz_unique_id: str) -> str:
     return f"QuizResults:{bot_token}:{quiz_unique_id}"
 
-# Modified to use quiz_unique_id instead of chat_id
 def quiz_time_key(bot_token: str, quiz_unique_id: str) -> str:
     return f"QuizTime:{bot_token}:{quiz_unique_id}"
 
-# Modified to use quiz_unique_id instead of chat_id
 def answered_key(bot_token: str, quiz_unique_id: str, question_id: int, user_id: int) -> str:
     return f"Answered:{bot_token}:{quiz_unique_id}:{question_id}:{user_id}"
 
-# Modified start_quiz to use quiz_unique_id and remove message_id, as it's now stored separately
 async def start_quiz(bot_token: str, quiz_unique_id: str, questions_db_path: str, stats_db_path: str, question_ids: list, time_per_question: int, creator_id: int):
     key = quiz_key(bot_token, quiz_unique_id)
     quiz_data = {
-        "status": "initializing",
-        "quiz_identifier": quiz_unique_id, # Store the identifier
+        "status": "initializing", # تم تغييرها إلى initializing
+        "quiz_identifier": quiz_unique_id,
         "question_ids": json.dumps(question_ids),
         "current_index": -1,
         "time_per_question": time_per_question,
@@ -45,21 +39,19 @@ async def start_quiz(bot_token: str, quiz_unique_id: str, questions_db_path: str
         "last_question_time": datetime.now().isoformat(),
         "creator_id": creator_id,
         "bot_token": bot_token,
-        # message_id and chat_id/inline_message_id are now managed by PHP and should be in Redis already
-        # before this start_quiz is called by the API.
         "questions_db_path": questions_db_path,
         "stats_db_path": stats_db_path
     }
     await redis_client.hmset(key, quiz_data)
     logger.info(f"Redis: Quiz {key} initialized.")
 
-# Modified to use quiz_unique_id
 async def activate_quiz(bot_token: str, quiz_unique_id: str):
+    # هذه الدالة لم تعد تُستخدم مباشرة في API start_competition
+    # لأن تعيين status إلى "active" يتم مباشرة في API endpoint.
     key = quiz_key(bot_token, quiz_unique_id)
     await redis_client.hset(key, "status", "active")
     logger.info(f"Redis: Quiz {key} status set to 'active'.")
 
-# Modified to use quiz_unique_id
 async def get_quiz_status(bot_token: str, quiz_unique_id: str):
     key = quiz_key(bot_token, quiz_unique_id)
     return await redis_client.hgetall(key)
@@ -67,7 +59,6 @@ async def get_quiz_status(bot_token: str, quiz_unique_id: str):
 async def get_quiz_status_by_key(key: str):
     return await redis_client.hgetall(key)
 
-# Modified to use quiz_unique_id
 async def set_current_question(bot_token: str, quiz_unique_id: str, question_id: int, end_time: datetime):
     key = quiz_time_key(bot_token, quiz_unique_id)
     time_data = {
@@ -79,12 +70,10 @@ async def set_current_question(bot_token: str, quiz_unique_id: str, question_id:
     await redis_client.expireat(key, end_time + timedelta(seconds=5))
     logger.info(f"Redis: Current question set to {question_id} for {quiz_time_key(bot_token, quiz_unique_id)}. Expires at {end_time.isoformat()}.")
 
-# Modified to use quiz_unique_id
 async def has_answered(bot_token: str, quiz_unique_id: str, question_id: int, user_id: int) -> bool:
     key = answered_key(bot_token, quiz_unique_id, question_id, user_id)
     return await redis_client.exists(key)
 
-# Modified to use quiz_unique_id
 async def record_answer(bot_token: str, quiz_unique_id: str, question_id: int, user_id: int, username: str, score: int, time_per_question: int):
     answered_key_str = answered_key(bot_token, quiz_unique_id, question_id, user_id)
     await redis_client.setex(answered_key_str, time_per_question + 5, "true")
@@ -95,7 +84,6 @@ async def record_answer(bot_token: str, quiz_unique_id: str, question_id: int, u
     await redis_client.hset(answers_key, f"answers.{question_id}", score)
     logger.debug(f"Redis: Recorded answer for user {user_id} on Q{question_id} (score: {score}) in quiz {quiz_unique_id}.")
 
-# Modified to use quiz_unique_id
 async def end_quiz(bot_token: str, quiz_unique_id: str):
     logger.info(f"Redis: Initiating full Redis cleanup for bot {bot_token}, quiz {quiz_unique_id}.")
 
