@@ -62,3 +62,19 @@ class TelegramBotServiceAsync :
             'chat_id': chat_id
         }
         return await self._post("exportChatInviteLink", data)
+
+    async def edit_inline_message(self, data: dict) -> dict:
+        # The 'inline_message_id' is passed directly in the data dict
+        # We also need to remove 'chat_id' and 'message_id' if they are present
+        data_to_send = data.copy()
+        data_to_send.pop('chat_id', None)
+        data_to_send.pop('message_id', None)
+        return await self._post("editMessageText", data_to_send)
+
+    async def answer_callback_query(self, callback_query_id: str, text: str, show_alert: bool = False) -> dict:
+        data = {
+            "callback_query_id": callback_query_id,
+            "text": text,
+            "show_alert": show_alert
+        }
+        return await self._post("answerCallbackQuery", data)

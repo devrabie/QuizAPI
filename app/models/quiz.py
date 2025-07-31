@@ -1,17 +1,17 @@
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Optional
 
 class StartCompetitionRequest(BaseModel):
     bot_token: str
+    quiz_identifier: str  # Changed from channel_id
     questions_db_path: str
     stats_db_path: str
-    channel_id: str
-    question_delay: int
     total_questions: int
+    question_delay: int
 
 class StopCompetitionRequest(BaseModel):
     bot_token: str
-    channel_id: str
+    quiz_identifier: str # Changed from channel_id
 
 class SubmitAnswerRequest(BaseModel):
     bot_token: str
@@ -19,13 +19,13 @@ class SubmitAnswerRequest(BaseModel):
     username: str
     question_id: int
     answer_index: int
-    channel_id: str
+    quiz_identifier: str # Changed from channel_id
 
 class CompetitionStatusResponse(BaseModel):
     status: str
+    participants: int
     current_question: Optional[int]
     total_questions: Optional[int]
-    participants: int
     time_remaining: Optional[int]
 
 class LeaderboardEntry(BaseModel):
@@ -34,4 +34,4 @@ class LeaderboardEntry(BaseModel):
     score: int
 
 class LeaderboardResponse(BaseModel):
-    leaderboard: List[LeaderboardEntry]
+    leaderboard: list[LeaderboardEntry]

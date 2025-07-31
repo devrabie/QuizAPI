@@ -4,11 +4,9 @@ from datetime import datetime, timedelta
 import logging
 import os
 
-# Set up detailed logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Make sure imports work by running from the project root
 try:
     from app.redis_client import redis_handler
     from app.database import sqlite_handler
@@ -20,8 +18,6 @@ except ImportError:
     from app.database import sqlite_handler
     from app.services.telegram_bot import TelegramBotServiceAsync
 
-
-# In-memory cache for bot instances
 bot_instances = {}
 
 def get_telegram_bot(token: str) -> TelegramBotServiceAsync:
@@ -30,49 +26,46 @@ def get_telegram_bot(token: str) -> TelegramBotServiceAsync:
     return bot_instances[token]
 
 async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotServiceAsync, time_left: float, force_update: bool = False):
-    """
-    Updates the Telegram message with the current participant count and time left.
-    Includes a rate-limiting check to avoid hitting API limits, which can be bypassed with force_update.
-    """
-    UPDATE_INTERVAL_SECONDS = 5  # Update every 5 seconds
+    UPDATE_INTERVAL_SECONDS = 5
     now = datetime.now()
 
     if not force_update:
-        # Rate limiting check
         last_update_str = await redis_handler.redis_client.hget(quiz_key, "last_display_update")
         if last_update_str:
             try:
                 last_update_time = datetime.fromisoformat(last_update_str)
                 if (now - last_update_time).total_seconds() < UPDATE_INTERVAL_SECONDS:
                     logger.debug(f"Worker: [{quiz_key}] Display update skipped due to rate limiting.")
-                    return  # Not time to update yet
+                    return
             except ValueError:
                 logger.warning(f"Worker: [{quiz_key}] Could not parse last_display_update timestamp: {last_update_str}")
 
-    # Proceed with update and set new timestamp
     await redis_handler.redis_client.hset(quiz_key, "last_display_update", now.isoformat())
     logger.info(f"Worker: [{quiz_key}] Proceeding with display update (force_update={force_update}).")
 
     bot_token = quiz_status.get("bot_token")
+    # Fetch identifier and message IDs from quiz_status
+    quiz_identifier = quiz_status.get("quiz_identifier") # This is the quiz_game_id
+    inline_message_id = quiz_status.get("inline_message_id")
     chat_id = quiz_status.get("chat_id")
-    message_id = int(quiz_status.get("message_id"))
-    # Retrieve the base question text (e.g., "**السؤال 1**: ما عاصمة مصر؟")
-    # This is the text *without* participants or time, which the worker will add dynamically.
+    message_id = quiz_status.get("message_id")
+
     base_question_text_from_redis = quiz_status.get("current_question_text", "")
 
-    if not all([bot_token, chat_id, message_id, base_question_text_from_redis]):
-        logger.warning(f"Worker: [{quiz_key}] Missing data needed to update display (token, chat, msg_id, or base_question_text). Skipping.")
+    if not all([bot_token, quiz_identifier, base_question_text_from_redis]):
+        logger.warning(f"Worker: [{quiz_key}] Missing core data (token, identifier, or base_question_text). Skipping.")
+        return
+    if not (inline_message_id or (chat_id and message_id)):
+        logger.warning(f"Worker: [{quiz_key}] Missing message identifiers (inline_message_id OR chat_id/message_id). Skipping.")
         return
 
-    # Get participant count by scanning answer keys
     try:
-        participant_keys = [key async for key in redis_handler.redis_client.scan_iter(f"QuizAnswers:{bot_token}:{chat_id}:*")]
+        participant_keys = [key async for key in redis_handler.redis_client.scan_iter(f"QuizAnswers:{bot_token}:{quiz_identifier}:*")]
         participants = len(participant_keys)
     except Exception as e:
         logger.error(f"Worker: [{quiz_key}] Failed to scan for participants: {e}", exc_info=True)
         return
 
-        # Construct the new text for the message, combining the base question text with live data
     new_text = (
         f"❓ {base_question_text_from_redis}\n\n"
         f"👥 **المشاركون**: {participants}\n"
@@ -84,16 +77,25 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
         logger.warning(f"Worker: [{quiz_key}] 'current_keyboard' not found in status. Cannot update message without it.")
         return
 
+    # Prepare message data for either inline or regular message editing
     message_data = {
-        "chat_id": chat_id,
-        "message_id": message_id,
         "text": new_text,
         "reply_markup": current_keyboard_str,
         "parse_mode": "Markdown"
     }
 
     try:
-        response = await asyncio.wait_for(telegram_bot.edit_message(message_data), timeout=10.0)
+        response = None
+        if inline_message_id:
+            message_data["inline_message_id"] = inline_message_id
+            response = await asyncio.wait_for(telegram_bot.edit_inline_message(message_data), timeout=10.0)
+        elif chat_id and message_id:
+            message_data["chat_id"] = chat_id
+            message_data["message_id"] = message_id
+            response = await asyncio.wait_for(telegram_bot.edit_message(message_data), timeout=10.0)
+        else:
+            logger.error(f"Worker: [{quiz_key}] No valid message identifier for editing.")
+            return
 
         if not response.get("ok"):
             if "message is not modified" not in response.get("description", ""):
@@ -117,10 +119,11 @@ async def process_active_quiz(quiz_key: str):
     if quiz_status.get("status") == "stopping":
         logger.info(f"Worker: [{quiz_key}] Found in 'stopping' state. Attempting to finalize.")
         bot_token = quiz_status.get("bot_token")
-        if bot_token:
+        quiz_identifier = quiz_status.get("quiz_identifier") # Get identifier for end_quiz
+        if bot_token and quiz_identifier:
             await end_quiz(quiz_key, quiz_status, get_telegram_bot(bot_token))
         else:
-            logger.error(f"Worker: [{quiz_key}] Cannot finalize 'stopping' quiz, bot_token is missing.")
+            logger.error(f"Worker: [{quiz_key}] Cannot finalize 'stopping' quiz, bot_token or quiz_identifier is missing.")
         return
 
     if quiz_status.get("status") != "active":
@@ -128,14 +131,14 @@ async def process_active_quiz(quiz_key: str):
         return
 
     bot_token = quiz_status.get("bot_token")
-    chat_id = quiz_status.get("chat_id")
-    if not bot_token:
-        logger.error(f"Worker: [{quiz_key}] Bot token not found in status. Cleaning up broken state.")
+    quiz_identifier = quiz_status.get("quiz_identifier") # Use quiz_identifier
+    if not bot_token or not quiz_identifier:
+        logger.error(f"Worker: [{quiz_key}] Bot token or quiz_identifier not found in status. Cleaning up broken state.")
         await redis_handler.redis_client.delete(quiz_key)
         return
 
     telegram_bot = get_telegram_bot(bot_token)
-    quiz_time_key = redis_handler.quiz_time_key(bot_token, chat_id)
+    quiz_time_key = redis_handler.quiz_time_key(bot_token, quiz_identifier)
     quiz_time = await redis_handler.redis_client.hgetall(quiz_time_key)
 
     logger.debug(f"Worker: [{quiz_key}] Full Status: {quiz_status}")
@@ -151,7 +154,6 @@ async def process_active_quiz(quiz_key: str):
             else:
                 time_left = (end_time - datetime.now()).total_seconds()
                 logger.debug(f"Worker: [{quiz_key}] Timer active. {time_left:.1f}s left. Calling display updater.")
-                # If timer is still active, update the display with countdown/participant info
                 await update_question_display(quiz_key, quiz_status, telegram_bot, time_left)
                 return
         except (ValueError, TypeError):
@@ -194,37 +196,54 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             await end_quiz(quiz_key, quiz_status, telegram_bot)
             return
 
-        # Base text for the new question (e.g., "**السؤال 2**: ما أكبر محيط؟")
-        # This part will be saved to Redis as `current_question_text` for dynamic updates.
         base_question_text_for_redis = f"**السؤال {next_index + 1}**: {question['question']}"
 
         options = [question['opt1'], question['opt2'], question['opt3'], question['opt4']]
+        # Important: Include quiz_identifier in callback data for answers for robust tracking
+        # This assumes quiz_game_id is used as quiz_identifier
+        quiz_identifier_for_callbacks = quiz_status.get("quiz_identifier")
         keyboard = {"inline_keyboard": [[{"text": opt, "callback_data": f"answer_{next_question_id}_{i}"}] for i, opt in enumerate(options)]}
+        # The above callback data currently does not include quiz_identifier. It should ideally be:
+        # [{"text": opt, "callback_data": f"answer_{quiz_identifier_for_callbacks}_{next_question_id}_{i}"}]
+        # This change needs to be propagated to the PHP CallbackqueryCommand's `handleQuizAnswer` as well.
+        # For now, it will use the scanning logic, but direct passing is better.
 
-        # Construct the FULL message text for the new question with initial dynamic info.
-        # This is what will be sent to Telegram. Initial participants will be 0 for a fresh question.
         time_per_question = int(quiz_status.get("time_per_question", 30))
-        initial_participants_count_for_new_q = 0
-        initial_time_display_for_new_q = time_per_question # Show full time for the new question
+        initial_participants_count_for_new_q = 0 # This will be updated by update_question_display
+        initial_time_display_for_new_q = time_per_question
         full_new_question_message_text = (
             f"❓ {base_question_text_for_redis}\n\n"
             f"👥 **المشاركون**: {initial_participants_count_for_new_q}\n"
             f"⏳ **الوقت المتبقي**: {initial_time_display_for_new_q} ثانية"
         )
 
+        # Retrieve message identifiers from quiz_status
+        inline_message_id = quiz_status.get("inline_message_id")
         chat_id = quiz_status.get("chat_id")
-        message_id = int(quiz_status.get("message_id")) # message_id is retrieved from Redis
+        message_id = quiz_status.get("message_id")
+
+        # Prepare message data for editing
         message_data = {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": full_new_question_message_text, # Send the full formatted text
+            "text": full_new_question_message_text,
             "reply_markup": json.dumps(keyboard),
             "parse_mode": "Markdown"
         }
 
-        logger.info(f"Worker: [{quiz_key}] Attempting to edit message {message_id} in chat {chat_id} with Q{next_index + 1} (ID: {next_question_id}).")
+        logger.info(f"Worker: [{quiz_key}] Attempting to edit message for Q{next_index + 1} (ID: {next_question_id}).")
         try:
-            response = await telegram_bot.edit_message(message_data)
+            response = None
+            if inline_message_id:
+                message_data["inline_message_id"] = inline_message_id
+                response = await telegram_bot.edit_inline_message(message_data)
+            elif chat_id and message_id:
+                message_data["chat_id"] = chat_id
+                message_data["message_id"] = message_id
+                response = await telegram_bot.edit_message(message_data)
+            else:
+                logger.error(f"Worker: [{quiz_key}] No valid message identifier to edit for next question. Ending quiz.")
+                await end_quiz(quiz_key, quiz_status, telegram_bot)
+                return
+
             logger.info(f"Worker: [{quiz_key}] Telegram API response for edit_message: {response}")
             if not response.get("ok"):
                 logger.error(f"Worker: [{quiz_key}] Telegram reported failure to edit message: {response.get('description')}. Ending quiz.")
@@ -239,8 +258,8 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
         end_time = datetime.now() + timedelta(seconds=time_per_question)
 
         bot_token = quiz_status.get("bot_token")
-        await redis_handler.set_current_question(bot_token, chat_id, next_question_id, end_time)
-        # Save the BASE question text (without dynamic info) and keyboard to Redis.
+        quiz_identifier = quiz_status.get("quiz_identifier")
+        await redis_handler.set_current_question(bot_token, quiz_identifier, next_question_id, end_time)
         await redis_handler.redis_client.hset(
             quiz_key, mapping={
                 "current_question_text": base_question_text_for_redis,
@@ -249,7 +268,6 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             }
         )
 
-        # Immediately call the display updater to add dynamic info (participants, countdown)
         logger.info(f"Worker: [{quiz_key}] Performing initial display update for new question.")
         refreshed_quiz_status = await redis_handler.get_quiz_status_by_key(quiz_key)
         await update_question_display(quiz_key, refreshed_quiz_status, telegram_bot, time_per_question, force_update=True)
@@ -262,7 +280,6 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
 
 
 async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotServiceAsync):
-    # --- LOCK MECHANISM TO PREVENT DEATH LOOPS ---
     lock_key = f"Lock:EndQuiz:{quiz_key}"
     if not await redis_handler.redis_client.set(lock_key, "true", ex=60, nx=True):
         logger.warning(f"Worker: [{quiz_key}] End process is already locked or in progress. Skipping to prevent loop.")
@@ -271,25 +288,33 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
     logger.info(f"Worker: [{quiz_key}] Starting end_quiz process (lock acquired).")
 
     bot_token = quiz_status.get("bot_token")
-    if not bot_token:
-        logger.error(f"Worker: [{quiz_key}] Cannot end quiz, bot_token is missing. Releasing lock and exiting.")
+    quiz_identifier = quiz_status.get("quiz_identifier")
+    if not bot_token or not quiz_identifier:
+        logger.error(f"Worker: [{quiz_key}] Cannot end quiz, bot_token or quiz_identifier is missing. Releasing lock and exiting.")
         await redis_handler.redis_client.delete(lock_key)
         return
 
-    chat_id =  quiz_status.get("chat_id")
-    message_id = int(quiz_status.get("message_id")) # message_id is retrieved from quiz_status
+    inline_message_id = quiz_status.get("inline_message_id")
+    chat_id = quiz_status.get("chat_id") # Use existing chat_id from quiz_status (if regular quiz)
+    message_id = quiz_status.get("message_id") # Use existing message_id from quiz_status (if regular quiz)
     stats_db_path = quiz_status.get("stats_db_path")
 
     if not stats_db_path:
         logger.error(f"Worker: [{quiz_key}] 'stats_db_path' not found in quiz status. Cannot save results to SQLite.")
         results_text = "🏆 **المسابقة انتهت!** 🏆\n\nحدث خطأ في حفظ النتائج. يرجى مراجعة سجلات الخادم."
-        message_data = {"chat_id": chat_id, "message_id": message_id, "text": results_text, "reply_markup": json.dumps({}), "parse_mode": "Markdown"}
+        message_data = {"text": results_text, "reply_markup": json.dumps({}), "parse_mode": "Markdown"}
         try:
-            await telegram_bot.edit_message(message_data)
+            if inline_message_id:
+                message_data["inline_message_id"] = inline_message_id
+                await telegram_bot.edit_inline_message(message_data)
+            elif chat_id and message_id:
+                message_data["chat_id"] = chat_id
+                message_data["message_id"] = message_id
+                await telegram_bot.edit_message(message_data)
             logger.info(f"Worker: [{quiz_key}] Error message sent to Telegram due to missing stats_db_path.")
         except Exception as e:
             logger.error(f"Worker: [{quiz_key}] Failed to send error message to Telegram: {e}", exc_info=True)
-        await redis_handler.end_quiz(bot_token, chat_id)
+        await redis_handler.end_quiz(bot_token, quiz_identifier)
         await redis_handler.redis_client.delete(lock_key)
         return
 
@@ -297,7 +322,7 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
 
     logger.info(f"Worker: [{quiz_key}] Calculating results from Redis.")
     final_scores = {}
-    async for key in redis_handler.redis_client.scan_iter(f"QuizAnswers:{bot_token}:{chat_id}:*"):
+    async for key in redis_handler.redis_client.scan_iter(f"QuizAnswers:{bot_token}:{quiz_identifier}:*"):
         try:
             user_id = int(key.split(":")[-1])
             user_data = await redis_handler.redis_client.hgetall(key)
@@ -329,7 +354,7 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
     if winner_id:
         results_text += f"🎉 **الفائز**: {winner_username} بـ {winner_score} نقطة!\n\n"
     else:
-        results_text += "😞 لم يشارك أحد في المسابقة أو لم يحصل أحد على نقاط.\n\n" # Emoji for no participants
+        results_text += "😞 لم يشارك أحد في المسابقة أو لم يحصل أحد على نقاط.\n\n"
 
     if len(sorted_participants) > 0:
         results_text += "🏅 **لوحة المتصدرين:**\n"
@@ -340,11 +365,12 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
             elif i == 2: rank_emoji = "🥉 "
             results_text += f"{rank_emoji}{i+1}. {data['username']}: {data['score']} نقطة\n"
     else:
-        results_text += "😔 لا توجد نتائج لعرضها.\n" # Emoji for no results
+        results_text += "😔 لا توجد نتائج لعرضها.\n"
 
     try:
         logger.info(f"Worker: [{quiz_key}] Saving quiz history and updating user stats in SQLite DB: {stats_db_path}")
-        quiz_history_id = await sqlite_handler.save_quiz_history(stats_db_path, chat_id, total_questions, winner_id, winner_score)
+        # Note: quiz_identifier is used as chat_id in quiz_history, might need to distinguish if real chat_id is ever needed here.
+        quiz_history_id = await sqlite_handler.save_quiz_history(stats_db_path, quiz_identifier, total_questions, winner_id, winner_score)
 
         for user_id, data in final_scores.items():
             total_points = data['score']
@@ -360,16 +386,21 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
     except Exception as e:
         logger.error(f"Worker: [{quiz_key}] Failed to save quiz results to SQLite: {e}", exc_info=True)
 
-    message_data = {"chat_id": chat_id, "message_id": message_id, "text": results_text, "reply_markup": json.dumps({}), "parse_mode": "Markdown"}
+    message_data = {"text": results_text, "reply_markup": json.dumps({}), "parse_mode": "Markdown"}
     try:
-        await telegram_bot.edit_message(message_data)
+        if inline_message_id:
+            message_data["inline_message_id"] = inline_message_id
+            await telegram_bot.edit_inline_message(message_data)
+        elif chat_id and message_id:
+            message_data["chat_id"] = chat_id
+            message_data["message_id"] = message_id
+            await telegram_bot.edit_message(message_data)
         logger.info(f"Worker: [{quiz_key}] Final results message sent to Telegram.")
     except Exception as e:
         logger.error(f"Worker: [{quiz_key}] Failed to send final message to Telegram: {e}", exc_info=True)
 
-    # Final cleanup of all Redis keys for this quiz
-    await redis_handler.end_quiz(bot_token, chat_id)
-    await redis_handler.redis_client.delete(lock_key) # Explicitly delete the end_quiz lock key
+    await redis_handler.end_quiz(bot_token, quiz_identifier)
+    await redis_handler.redis_client.delete(lock_key)
     logger.info(f"Worker: [{quiz_key}] Quiz has ended and been cleaned up from Redis, including the lock.")
 
 
@@ -377,6 +408,7 @@ async def main_loop():
     logger.info("Worker: Starting main loop...")
     while True:
         try:
+            # Scan for both regular and inline quiz keys
             active_quiz_keys = [key async for key in redis_handler.redis_client.scan_iter("Quiz:*:*")]
 
             if active_quiz_keys:
@@ -393,7 +425,6 @@ async def main_loop():
             logger.error(f"Worker: An critical error occurred in the main loop: {e}", exc_info=True)
 
         await asyncio.sleep(1)
-
 
 if __name__ == "__main__":
     try:
