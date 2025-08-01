@@ -20,14 +20,25 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     quiz_unique_id = request.quiz_identifier
 
     await sqlite_handler.create_tables(request.stats_db_path)
-    questions = await sqlite_handler.get_questions(request.questions_db_path, request.total_questions)
-    if not questions:
-        logger.error(f"API: No questions found in {request.questions_db_path} for total_questions {request.total_questions}")
-        raise HTTPException(status_code=404, detail="لم يتم العثور على أي أسئلة في قاعدة البيانات.")
 
+    # --- تعديل: جلب الأسئلة بناءً على الفئة المُمررة ---
+    # category الآن هو parameter اختياري في الطلب.
+    category_to_fetch = request.category if hasattr(request, 'category') else None
+
+    # إذا كانت الفئة غير محددة أو فارغة، يمكن التعامل معها كفئة عامة أو رفع خطأ
+    if not category_to_fetch:
+        logger.warning(f"API: No category specified for quiz {quiz_unique_id}. Attempting to fetch random questions (if supported by sqlite_handler).")
+        # إذا لم يكن لديك دالة لجلب أسئلة عشوائية بدون فئة في sqlite_handler، قد تحتاج لرفع خطأ
+        questions = await sqlite_handler.get_questions(request.questions_db_path, request.total_questions) # افتراضياً جلب عشوائي
+    else:
+        questions = await sqlite_handler.get_questions_by_category(request.questions_db_path, category_to_fetch, request.total_questions)
+        if not questions:
+            logger.error(f"API: No questions found in category '{category_to_fetch}' for total_questions {request.total_questions}")
+            raise HTTPException(status_code=404, detail=f"لم يتم العثور على أي أسئلة في فئة '{category_to_fetch}'. يرجى اختيار فئة أخرى أو إضافة أسئلة.")
+
+    # ... (بقية الكود هو نفسه من التحديثات السابقة)
     question_ids = [q['id'] for q in questions]
 
-    # --- البدء بالتحقق من حالة المسابقة الحالية ---
     current_quiz_status = await redis_handler.get_quiz_status(request.bot_token, quiz_unique_id)
 
     if not current_quiz_status:
@@ -37,15 +48,12 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     if current_quiz_status.get("status") != "pending":
         logger.warning(f"API: Competition start request for {quiz_unique_id} rejected. Current status: {current_quiz_status.get('status')}. Expected 'pending'.")
         raise HTTPException(status_code=400, detail=f"المسابقة ليست في حالة انتظار (pending). حالتها الحالية: {current_quiz_status.get('status')}.")
-    # --- نهاية التحقق من حالة المسابقة الحالية ---
 
     telegram_bot = TelegramBotServiceAsync(request.bot_token)
     first_question = questions[0]
 
     base_question_text_for_redis = f"**السؤال 1**: {first_question['question']}"
     options = [first_question['opt1'], first_question['opt2'], first_question['opt3'], first_question['opt4']]
-    # هذا الكيبورد يتم إرساله مرة واحدة فقط عند بدء المسابقة
-    # يجب أن يحتوي على quiz_game_id (quiz_unique_id)
     keyboard = {
         "inline_keyboard": [
             [{"text": opt, "callback_data": f"answer_{quiz_unique_id}_{first_question['id']}_{i}"}]
@@ -53,13 +61,12 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         ]
     }
 
-    # تحميل بيانات اللاعبين الموجودة بالفعل في Redis (خاصة للمسابقات المضمنة)
     existing_quiz_state = await redis_handler.redis_client.hgetall(redis_handler.quiz_key(request.bot_token, quiz_unique_id))
     players_json = existing_quiz_state.get('players', '[]')
     try:
         current_participants = len(json.loads(players_json))
     except json.JSONDecodeError:
-        current_participants = 0 # Fallback if JSON is malformed
+        current_participants = 0
 
     initial_time_display = request.question_delay
     full_initial_message_text = (
@@ -68,13 +75,11 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         f"⏳ **الوقت المتبقي**: {initial_time_display} ثانية"
     )
 
-    # استرداد inline_message_id أو chat_id/message_id من Redis
     message_identifier_data = await redis_handler.redis_client.hgetall(redis_handler.quiz_key(request.bot_token, quiz_unique_id))
     inline_message_id = message_identifier_data.get('inline_message_id')
     chat_id_from_redis = message_identifier_data.get('chat_id')
     message_id_from_redis = message_identifier_data.get('message_id')
 
-    # تحضير بيانات الرسالة لـ Telegram API (سواء كانت مضمنة أو عادية)
     message_params = {
         "text": full_initial_message_text,
         "reply_markup": json.dumps(keyboard),
@@ -100,23 +105,19 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
             logger.error(f"API: Failed to update message in Telegram: {sent_message.get('description')}")
             raise HTTPException(status_code=500, detail=f"فشل في تعديل الرسالة الأولى في تيليجرام: {sent_message.get('description')}")
 
-        # --- تحديث معرفات الرسالة بعد الإرسال الناجح ---
         if sent_message.get("result"):
-            if chat_id_from_redis and message_id_from_redis: # إذا كانت رسالة دردشة عادية
+            if chat_id_from_redis and message_id_from_redis:
                 chat_id_from_response = sent_message["result"].get("chat", {}).get("id")
                 message_id_from_response = sent_message["result"].get("message_id")
                 if chat_id_from_response and message_id_from_response:
                     chat_id_from_redis = chat_id_from_response
                     message_id_from_redis = message_id_from_response
-                    logger.debug(f"API: Updated chat_id/message_id from Telegram response: {chat_id_from_redis}/{message_id_from_redis}")
-        # --- نهاية تحديث المعرفات ---
+                    logger.debug(f"API: Updated chat_id/message_id from Telegram response: {chat_id_from_redis}/{message_id_from_response}")
 
     except Exception as e:
         logger.error(f"API: Error sending/editing first message for quiz {quiz_unique_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"خطأ أثناء تعديل الرسالة الأولى للمسابقة: {e}")
 
-    # تخزين حالة المسابقة باستخدام quiz_unique_id
-    # هذا سيقوم بتغيير الحالة في Redis إلى 'initializing'
     await redis_handler.start_quiz(
         bot_token=request.bot_token,
         quiz_unique_id=quiz_unique_id,
@@ -127,14 +128,12 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         creator_id=existing_quiz_state.get('creator_id', 0)
     )
 
-    # --- تحديث حالة المسابقة إلى 'active' وحفظ معرفات الرسالة في Redis ---
     quiz_key = redis_handler.quiz_key(request.bot_token, quiz_unique_id)
 
-    # بناء القاموس للـ HSET. يجب أن نتجنب قيم None.
     data_to_set_in_redis = {
         "current_question_text": base_question_text_for_redis,
         "current_keyboard": json.dumps(keyboard),
-        "status": "active" # تعيين الحالة إلى active هنا
+        "status": "active"
     }
 
     if inline_message_id is not None:
@@ -146,7 +145,6 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         logger.warning(f"API: No message identifiers to save in Redis for quiz {quiz_unique_id}. Display might not update.")
 
     await redis_handler.redis_client.hset(quiz_key, mapping=data_to_set_in_redis)
-    # --- نهاية تحديث الحالة وحفظ المعرفات ---
 
     end_time = datetime.now() + timedelta(seconds=request.question_delay)
     await redis_handler.set_current_question(request.bot_token, quiz_unique_id, first_question['id'], end_time)
@@ -155,10 +153,6 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     logger.info(f"API: Competition started successfully for bot {request.bot_token} with identifier {quiz_unique_id}. Quiz state saved to Redis.")
     return {"message": "Competition started."}
 
-# ... (بقية نقاط النهاية: stop_competition, submit_answer, competition_status, cleanup)
-# لم يتم تضمينها هنا لتجنب التكرار، لكن يجب أن تكون موجودة في ملف quiz.py الخاص بك.
-
-# فيما يلي كود `stop_competition` و `submit_answer` فقط للتأكد من أنها لم تتغير بشكل غير مقصود:
 
 @router.post("/stop_competition")
 async def stop_competition(request: quiz_models.StopCompetitionRequest):
@@ -232,7 +226,7 @@ async def submit_answer(request: quiz_models.SubmitAnswerRequest):
 
     await redis_handler.record_answer(
         bot_token=request.bot_token,
-        quiz_unique_id=quiz_unique_id, # Use quiz_unique_id
+        quiz_unique_id=quiz_unique_id,
         question_id=request.question_id,
         user_id=request.user_id,
         username=request.username,
@@ -241,6 +235,7 @@ async def submit_answer(request: quiz_models.SubmitAnswerRequest):
     )
 
     return {"message": "Answer submitted.", "correct": correct, "score": score, "correct_answer_text": correct_answer_text}
+
 
 @router.get("/competition_status", response_model=quiz_models.CompetitionStatusResponse)
 async def competition_status(bot_token: str, quiz_identifier: str):
