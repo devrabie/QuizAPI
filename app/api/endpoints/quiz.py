@@ -26,17 +26,14 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         raise HTTPException(status_code=404, detail="لم يتم العثور على أي أسئلة في قاعدة البيانات.")
 
     question_ids = [q['id'] for q in questions]
-    creator_id = 0 # This will be set by PHP via inline_query and stored in Redis already for inline quizzes
 
     # --- البدء بالتحقق من حالة المسابقة الحالية ---
     current_quiz_status = await redis_handler.get_quiz_status(request.bot_token, quiz_unique_id)
 
     if not current_quiz_status:
-        # إذا لم يتم العثور على المفتاح في Redis على الإطلاق، فهذه مشكلة
         logger.error(f"API: Start request for non-existent quiz {quiz_unique_id}. Check if quiz was created via inline query.")
         raise HTTPException(status_code=404, detail="المسابقة غير موجودة أو انتهت صلاحيتها. يرجى إنشاء مسابقة جديدة.")
 
-    # نتحقق فقط من أن الحالة "pending" للسماح بالبدء
     if current_quiz_status.get("status") != "pending":
         logger.warning(f"API: Competition start request for {quiz_unique_id} rejected. Current status: {current_quiz_status.get('status')}. Expected 'pending'.")
         raise HTTPException(status_code=400, detail=f"المسابقة ليست في حالة انتظار (pending). حالتها الحالية: {current_quiz_status.get('status')}.")
@@ -47,9 +44,12 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
 
     base_question_text_for_redis = f"**السؤال 1**: {first_question['question']}"
     options = [first_question['opt1'], first_question['opt2'], first_question['opt3'], first_question['opt4']]
+    # هذا الكيبورد يتم إرساله مرة واحدة فقط عند بدء المسابقة
+    # يجب أن يحتوي على quiz_game_id (quiz_unique_id)
     keyboard = {
         "inline_keyboard": [
-            [{"text": opt, "callback_data": f"answer_{first_question['id']}_{i}"}] for i, opt in enumerate(options)
+            [{"text": opt, "callback_data": f"answer_{quiz_unique_id}_{first_question['id']}_{i}"}]
+            for i, opt in enumerate(options)
         ]
     }
 
@@ -99,6 +99,18 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         if not sent_message.get("ok"):
             logger.error(f"API: Failed to update message in Telegram: {sent_message.get('description')}")
             raise HTTPException(status_code=500, detail=f"فشل في تعديل الرسالة الأولى في تيليجرام: {sent_message.get('description')}")
+
+        # --- تحديث معرفات الرسالة بعد الإرسال الناجح ---
+        if sent_message.get("result"):
+            if chat_id_from_redis and message_id_from_redis: # إذا كانت رسالة دردشة عادية
+                chat_id_from_response = sent_message["result"].get("chat", {}).get("id")
+                message_id_from_response = sent_message["result"].get("message_id")
+                if chat_id_from_response and message_id_from_response:
+                    chat_id_from_redis = chat_id_from_response
+                    message_id_from_redis = message_id_from_response
+                    logger.debug(f"API: Updated chat_id/message_id from Telegram response: {chat_id_from_redis}/{message_id_from_redis}")
+        # --- نهاية تحديث المعرفات ---
+
     except Exception as e:
         logger.error(f"API: Error sending/editing first message for quiz {quiz_unique_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"خطأ أثناء تعديل الرسالة الأولى للمسابقة: {e}")
@@ -119,7 +131,6 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     quiz_key = redis_handler.quiz_key(request.bot_token, quiz_unique_id)
 
     # بناء القاموس للـ HSET. يجب أن نتجنب قيم None.
-    # قيم None ستسبب DataError عند محاولة حفظها في Redis-py.
     data_to_set_in_redis = {
         "current_question_text": base_question_text_for_redis,
         "current_keyboard": json.dumps(keyboard),
@@ -129,11 +140,9 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     if inline_message_id is not None:
         data_to_set_in_redis["inline_message_id"] = inline_message_id
     elif chat_id_from_redis is not None and message_id_from_redis is not None:
-        # تأكد أن chat_id و message_id يتم تحويلهما إلى سلاسل نصية
         data_to_set_in_redis["chat_id"] = str(chat_id_from_redis)
         data_to_set_in_redis["message_id"] = str(message_id_from_redis)
     else:
-        # هذا السيناريو يجب أن لا يحدث بعد التحقق العلوي، لكن هو احتياطي
         logger.warning(f"API: No message identifiers to save in Redis for quiz {quiz_unique_id}. Display might not update.")
 
     await redis_handler.redis_client.hset(quiz_key, mapping=data_to_set_in_redis)
