@@ -22,19 +22,23 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     await sqlite_handler.create_tables(request.stats_db_path)
 
     # --- تعديل: جلب الأسئلة بناءً على الفئة المُمررة ---
-    # category الآن هو parameter اختياري في الطلب.
-    category_to_fetch = request.category if hasattr(request, 'category') else None
+    category_to_fetch = request.category # سيصل هنا كـ None أو اسم الفئة أو 'General'
 
-    # إذا كانت الفئة غير محددة أو فارغة، يمكن التعامل معها كفئة عامة أو رفع خطأ
-    if not category_to_fetch:
-        logger.warning(f"API: No category specified for quiz {quiz_unique_id}. Attempting to fetch random questions (if supported by sqlite_handler).")
-        # إذا لم يكن لديك دالة لجلب أسئلة عشوائية بدون فئة في sqlite_handler، قد تحتاج لرفع خطأ
-        questions = await sqlite_handler.get_questions(request.questions_db_path, request.total_questions) # افتراضياً جلب عشوائي
-    else:
+    if category_to_fetch == 'General':
+        questions = await sqlite_handler.get_questions_general(request.questions_db_path, request.total_questions)
+        if not questions:
+            logger.error(f"API: No general questions found in {request.questions_db_path} for total_questions {request.total_questions}")
+            raise HTTPException(status_code=404, detail="لم يتم العثور على أي أسئلة عامة في قاعدة البيانات.")
+    elif category_to_fetch: # إذا كانت فئة محددة (ليست None وليست 'General')
         questions = await sqlite_handler.get_questions_by_category(request.questions_db_path, category_to_fetch, request.total_questions)
         if not questions:
             logger.error(f"API: No questions found in category '{category_to_fetch}' for total_questions {request.total_questions}")
             raise HTTPException(status_code=404, detail=f"لم يتم العثور على أي أسئلة في فئة '{category_to_fetch}'. يرجى اختيار فئة أخرى أو إضافة أسئلة.")
+    else: # إذا لم يتم تحديد فئة (يجب أن لا يحدث مع التدفق الجديد)
+        logger.error(f"API: Start request for quiz {quiz_unique_id} missing category info. Defaulting to general questions.")
+        questions = await sqlite_handler.get_questions_general(request.questions_db_path, request.total_questions)
+        if not questions:
+            raise HTTPException(status_code=404, detail="لم يتم العثور على أي أسئلة في قاعدة البيانات (لم يتم تحديد فئة).")
 
     # ... (بقية الكود هو نفسه من التحديثات السابقة)
     question_ids = [q['id'] for q in questions]

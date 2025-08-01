@@ -6,8 +6,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 async def create_tables(db_path: str):
-    # لا توجد تغييرات هنا، فقط تأكد من أن الدالة موجودة
-    # ... (الكود الحالي لإنشاء الجداول)
     async with aiosqlite.connect(db_path) as db:
         await db.execute('''
             CREATE TABLE IF NOT EXISTS quiz_history (
@@ -42,15 +40,15 @@ async def create_tables(db_path: str):
         ''')
         await db.commit()
 
-async def get_questions(db_path: str, count: int = 10) -> list:
-    # جلب أسئلة عشوائية من أي فئة (إذا لم يتم تحديد فئة)
+async def get_questions_general(db_path: str, count: int = 10) -> list:
+    # جلب أسئلة عشوائية من كل الفئات (الخيار العام)
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute('SELECT * FROM questions ORDER BY RANDOM() LIMIT ?', (count,))
         questions = await cursor.fetchall()
         return [dict(q) for q in questions]
 
-# دالة جديدة: جلب أسئلة حسب الفئة
+# دالة جديدة: جلب أسئلة حسب اسم الفئة (التي تُرسل من PHP)
 async def get_questions_by_category(db_path: str, category_name: str, count: int = 10) -> list:
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
@@ -81,7 +79,6 @@ async def save_quiz_participant(db_path: str, quiz_history_id: int, user_id: int
             (quiz_history_id, user_id, score, json.dumps(answers))
         )
         await db.commit()
-
 
 async def update_user_stats(db_path: str, user_id: int, username: str, points: int, correct_answers: int, wrong_answers: int):
     async with aiosqlite.connect(db_path) as db:

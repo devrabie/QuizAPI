@@ -8,6 +8,8 @@ class StartCompetitionRequest(BaseModel):
     stats_db_path: str
     total_questions: int
     question_delay: int
+    category: Optional[str] = None # إضافة حقل الفئة هنا (سيكون اسم الفئة)
+
 
 class StopCompetitionRequest(BaseModel):
     bot_token: str
