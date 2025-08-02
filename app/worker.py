@@ -1,5 +1,3 @@
-# main_worker.py
-
 import asyncio
 import json
 from datetime import datetime, timedelta
@@ -97,26 +95,38 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
             logger.error(f"Worker: [{quiz_key}] No valid message identifier for editing.")
             return
 
+        # --- START ADDED CODE BLOCK ---
+        # فحص نوع الاستجابة قبل محاولة الوصول إلى خصائصها
+        if not isinstance(response, dict):
+            logger.error(f"Worker: [{quiz_key}] Telegram API call returned unexpected type: {type(response)} with value {response}. Expected dict.")
+            if response is True: # إذا أعادت API تيليجرام True (نجاح بدون تفاصيل JSON)
+                logger.debug(f"Worker: [{quiz_key}] Telegram API call assumed successful (returned True). Skipping detailed result parsing.")
+                return # يمكننا افتراض النجاح ولكن لا توجد بيانات لتحديثها
+            else: # إذا أعادت False أو None أو أي نوع غير متوقع
+                logger.error(f"Worker: [{quiz_key}] Telegram API call failed or returned unexpected non-dict value.")
+                return # حدث فشل، نخرج من الدالة
+        # --- END ADDED CODE BLOCK ---
+
         if not response.get("ok"):
             if "message is not modified" not in response.get("description", ""):
                 logger.error(f"Worker: [{quiz_key}] Telegram reported failure to update display: {response.get('description')}")
         else:
             logger.debug(f"Worker: [{quiz_key}] Successfully updated display message.")
 
-        # --- تحديث معرفات الرسالة في Redis بعد كل تحديث للرسالة ---
-        if response.get("result"):
-            updated_inline_message_id = response["result"].get("inline_message_id")
-            updated_chat_id = response["result"].get("chat", {}).get("id")
-            updated_message_id = response["result"].get("message_id")
+            # --- تحديث معرفات الرسالة في Redis بعد كل تحديث للرسالة ---
+            if response.get("result"):
+                updated_inline_message_id = response["result"].get("inline_message_id")
+                updated_chat_id = response["result"].get("chat", {}).get("id")
+                updated_message_id = response["result"].get("message_id")
 
-            if updated_inline_message_id and quiz_status.get("inline_message_id") != updated_inline_message_id:
-                await redis_handler.redis_client.hset(quiz_key, "inline_message_id", updated_inline_message_id)
-                logger.debug(f"Worker: [{quiz_key}] Updated inline_message_id in Redis: {updated_inline_message_id}")
-            elif updated_chat_id and updated_message_id:
-                if quiz_status.get("chat_id") != str(updated_chat_id) or quiz_status.get("message_id") != str(updated_message_id):
-                    await redis_handler.redis_client.hset(quiz_key, "chat_id", str(updated_chat_id))
-                    await redis_handler.redis_client.hset(quiz_key, "message_id", str(updated_message_id))
-                    logger.debug(f"Worker: [{quiz_key}] Updated chat_id/message_id in Redis: {updated_chat_id}/{updated_message_id}")
+                if updated_inline_message_id and quiz_status.get("inline_message_id") != updated_inline_message_id:
+                    await redis_handler.redis_client.hset(quiz_key, "inline_message_id", updated_inline_message_id)
+                    logger.debug(f"Worker: [{quiz_key}] Updated inline_message_id in Redis: {updated_inline_message_id}")
+                elif updated_chat_id and updated_message_id:
+                    if quiz_status.get("chat_id") != str(updated_chat_id) or quiz_status.get("message_id") != str(updated_message_id):
+                        await redis_handler.redis_client.hset(quiz_key, "chat_id", str(updated_chat_id))
+                        await redis_handler.redis_client.hset(quiz_key, "message_id", str(updated_message_id))
+                        logger.debug(f"Worker: [{quiz_key}] Updated chat_id/message_id in Redis: {updated_chat_id}/{updated_message_id}")
 
     except asyncio.TimeoutError:
         logger.warning(f"Worker: [{quiz_key}] Timed out while trying to update display message.")
@@ -252,6 +262,20 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
                 logger.error(f"Worker: [{quiz_key}] No valid message identifier to edit for next question. Ending quiz.")
                 await end_quiz(quiz_key, quiz_status, telegram_bot)
                 return
+
+            # --- START ADDED CODE BLOCK ---
+            # فحص نوع الاستجابة قبل محاولة الوصول إلى خصائصها
+            if not isinstance(response, dict):
+                logger.error(f"Worker: [{quiz_key}] Telegram API call returned unexpected type: {type(response)} with value {response}. Expected dict.")
+                if response is True: # إذا أعادت API تيليجرام True (نجاح بدون تفاصيل JSON)
+                    logger.debug(f"Worker: [{quiz_key}] Telegram API call assumed successful (returned True). Skipping detailed result parsing.")
+                    # إذا تم التحرير بنجاح ولكن بدون تفاصيل، يمكننا المتابعة
+                    # (هذا يعني أن معرفات الرسالة لن يتم تحديثها، ولكن الرسالة قد تكون مرئية للمستخدم)
+                else: # إذا أعادت False أو None أو أي نوع غير متوقع
+                    logger.error(f"Worker: [{quiz_key}] Telegram API call failed or returned unexpected non-dict value. Ending quiz.")
+                    await end_quiz(quiz_key, quiz_status, telegram_bot)
+                return # نعود لمنع المزيد من الأخطاء في هذا التكرار
+            # --- END ADDED CODE BLOCK ---
 
             logger.info(f"Worker: [{quiz_key}] Telegram API response for edit_message: {response}")
             if not response.get("ok"):
@@ -437,18 +461,21 @@ async def main_loop():
             # الخطوة 1: جلب جميع المفاتيح التي تبدأ بـ "Quiz:"
             all_quiz_related_keys = [key async for key in redis_handler.redis_client.scan_iter("Quiz:*:*")]
 
+            # --- START MODIFIED CODE BLOCK ---
             # الخطوة 2: تصفية المفاتيح لمعالجة مفاتيح حالة المسابقة الرئيسية فقط
+            # المفتاح الرئيسي للمسابقة يجب أن يكون بالصيغة "Quiz:bot_token:quiz_identifier"
+            # أي 3 أجزاء عند التقسيم بواسطة ":"
             active_quiz_keys = []
             for key in all_quiz_related_keys:
-                # تقسيم المفتاح بواسطة ":" للتحقق من عدد الأجزاء
-                # المفتاح الرئيسي للمسابقة يجب أن يكون بالصيغة "Quiz:bot_token:quiz_identifier"
-                # أي 3 أجزاء عند التقسيم بواسطة ":"
                 parts = key.split(':')
                 if len(parts) == 3 and parts[0] == 'Quiz':
-                    active_quiz_keys.append(key)
+                    # تأكد أيضاً أن quiz_identifier ليس فارغاً تماماً
+                    if parts[2]:
+                        active_quiz_keys.append(key)
                 else:
-                    # هذه مفاتيح فرعية أو غير ذات صلة بحالة المسابقة الرئيسية، يمكننا تسجيلها للتصحيح
+                    # هذه مفاتيح فرعية أو غير ذات صلة بحالة المسابقة الرئيسية
                     logger.debug(f"Worker: Skipping non-main quiz key: {key} (parts: {len(parts)})")
+            # --- END MODIFIED CODE BLOCK ---
 
             if active_quiz_keys:
                 logger.info(f"Worker: Found {len(active_quiz_keys)} *main* quiz keys to process: {active_quiz_keys}")
@@ -472,3 +499,4 @@ if __name__ == "__main__":
         logger.info("Worker: Shutting down gracefully.")
     except Exception as e:
         logger.error(f"Worker: Fatal error in worker startup/main: {e}", exc_info=True)
+
