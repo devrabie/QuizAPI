@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timedelta
 import logging
 import os
+import html # <--- تم إضافة هذا الاستيراد
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -49,7 +50,8 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
     chat_id = quiz_status.get("chat_id")
     message_id = quiz_status.get("message_id")
 
-    base_question_text_from_redis = quiz_status.get("current_question_text", "")
+    # تطبيق html.escape على النص الأساسي للسؤال
+    base_question_text_from_redis = html.escape(quiz_status.get("current_question_text", ""))
 
     if not all([bot_token, quiz_identifier, base_question_text_from_redis]):
         logger.warning(f"Worker: [{quiz_key}] Missing core data (token, identifier, or base_question_text). Skipping.")
@@ -67,8 +69,8 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
 
     new_text = (
         f"❓ {base_question_text_from_redis}\n\n"
-        f"👥 **المشاركون**: {participants}\n"
-        f"⏳ **الوقت المتبقي**: {int(time_left)} ثانية"
+        f"👥 <b>المشاركون</b>: {participants}\n" # <--- استخدام <b> بدلاً من **
+        f"⏳ <b>الوقت المتبقي</b>: {int(time_left)} ثانية" # <--- استخدام <b> بدلاً من **
     )
 
     current_keyboard_str = quiz_status.get("current_keyboard")
@@ -79,7 +81,7 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
     message_data = {
         "text": new_text,
         "reply_markup": current_keyboard_str,
-        "parse_mode": "Markdown"
+        "parse_mode": "HTML" # <--- تم التغيير إلى HTML
     }
 
     try:
@@ -95,14 +97,17 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
             logger.error(f"Worker: [{quiz_key}] No valid message identifier for editing.")
             return
 
-        if not response.get("ok"):
+        # حل مشكلة 'bool' object has no attribute 'get'
+        if response.get("ok") and response.get("result") is True:
+            logger.debug(f"Worker: [{quiz_key}] Telegram reported message edited successfully (result=True), no new IDs to update.")
+        elif not response.get("ok"):
             if "message is not modified" not in response.get("description", ""):
                 logger.error(f"Worker: [{quiz_key}] Telegram reported failure to update display: {response.get('description')}")
         else:
             logger.debug(f"Worker: [{quiz_key}] Successfully updated display message.")
 
-        # --- تحديث معرفات الرسالة في Redis بعد كل تحديث للرسالة ---
-        if response.get("result"):
+        # تحديث معرفات الرسالة في Redis بعد كل تحديث للرسالة
+        if response.get("result") and isinstance(response.get("result"), dict): # التحقق من أن 'result' هو قاموس
             updated_inline_message_id = response["result"].get("inline_message_id")
             updated_chat_id = response["result"].get("chat", {}).get("id")
             updated_message_id = response["result"].get("message_id")
@@ -210,9 +215,10 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             await end_quiz(quiz_key, quiz_status, telegram_bot)
             return
 
-        base_question_text_for_redis = f"**السؤال {next_index + 1}**: {question['question']}"
+        # تطبيق html.escape على نص السؤال
+        base_question_text_for_redis = f"<b>السؤال {next_index + 1}</b>: {html.escape(question['question'])}" # <--- استخدام <b> و html.escape
 
-        options = [question['opt1'], question['opt2'], question['opt3'], question['opt4']]
+        options = [html.escape(question['opt1']), html.escape(question['opt2']), html.escape(question['opt3']), html.escape(question['opt4'])] # <--- html.escape على الخيارات
         # تم تعديل هذا السطر لتضمين quiz_game_id (quiz_identifier) في callback_data
         quiz_identifier_for_callbacks = quiz_status.get("quiz_identifier")
         keyboard = {"inline_keyboard": [[{"text": opt, "callback_data": f"answer_{quiz_identifier_for_callbacks}_{next_question_id}_{i}"}] for i, opt in enumerate(options)]}
@@ -222,8 +228,8 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
         initial_time_display_for_new_q = time_per_question
         full_new_question_message_text = (
             f"❓ {base_question_text_for_redis}\n\n"
-            f"👥 **المشاركون**: {initial_participants_count_for_new_q}\n"
-            f"⏳ **الوقت المتبقي**: {initial_time_display_for_new_q} ثانية"
+            f"👥 <b>المشاركون</b>: {initial_participants_count_for_new_q}\n" # <--- استخدام <b>
+            f"⏳ <b>الوقت المتبقي</b>: {initial_time_display_for_new_q} ثانية" # <--- استخدام <b>
         )
 
         inline_message_id = quiz_status.get("inline_message_id")
@@ -233,7 +239,7 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
         message_data = {
             "text": full_new_question_message_text,
             "reply_markup": json.dumps(keyboard),
-            "parse_mode": "Markdown"
+            "parse_mode": "HTML" # <--- تم التغيير إلى HTML
         }
 
         logger.info(f"Worker: [{quiz_key}] Attempting to edit message for Q{next_index + 1} (ID: {next_question_id}).")
@@ -252,15 +258,18 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
                 return
 
             logger.info(f"Worker: [{quiz_key}] Telegram API response for edit_message: {response}")
-            if not response.get("ok"):
+            # حل مشكلة 'bool' object has no attribute 'get'
+            if response.get("ok") and response.get("result") is True:
+                logger.debug(f"Worker: [{quiz_key}] Telegram reported message edited successfully (result=True), no new IDs to update.")
+            elif not response.get("ok"):
                 if "message is not modified" not in response.get("description", ""):
                     logger.error(f"Worker: [{quiz_key}] Telegram reported failure to edit message: {response.get('description')}. Ending quiz.")
                     await end_quiz(quiz_key, quiz_status, telegram_bot)
                     return
             logger.info(f"Worker: [{quiz_key}] Question {next_index + 1} (ID: {next_question_id}) sent/edited successfully.")
 
-            # --- تحديث معرفات الرسالة في Redis بعد كل تحديث للرسالة ---
-            if response.get("result"):
+            # تحديث معرفات الرسالة في Redis بعد كل تحديث للرسالة
+            if response.get("result") and isinstance(response.get("result"), dict): # التحقق من أن 'result' هو قاموس
                 updated_inline_message_id = response["result"].get("inline_message_id")
                 updated_chat_id = response["result"].get("chat", {}).get("id")
                 updated_message_id = response["result"].get("message_id")
@@ -273,7 +282,6 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
                         await redis_handler.redis_client.hset(quiz_key, "chat_id", str(updated_chat_id))
                         await redis_handler.redis_client.hset(quiz_key, "message_id", str(updated_message_id))
                         logger.debug(f"Worker: [{quiz_key}] Updated chat_id/message_id in Redis: {updated_chat_id}/{updated_message_id}")
-            # --- نهاية الجزء المُضاف/المُعدَّل ---
 
         except asyncio.TimeoutError:
             logger.warning(f"Worker: [{quiz_key}] Timed out while trying to update display message.")
@@ -326,8 +334,8 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
 
     if not stats_db_path:
         logger.error(f"Worker: [{quiz_key}] 'stats_db_path' not found in quiz status. Cannot save results to SQLite.")
-        results_text = "🏆 **المسابقة انتهت!** 🏆\n\nحدث خطأ في حفظ النتائج. يرجى مراجعة سجلات الخادم."
-        message_data = {"text": results_text, "reply_markup": json.dumps({}), "parse_mode": "Markdown"}
+        results_text = "🏆 <b>المسابقة انتهت!</b> 🏆\n\nحدث خطأ في حفظ النتائج. يرجى مراجعة سجلات الخادم." # <--- استخدام <b>
+        message_data = {"text": results_text, "reply_markup": json.dumps({}), "parse_mode": "HTML"} # <--- تم التغيير إلى HTML
         try:
             if inline_message_id:
                 message_data["inline_message_id"] = inline_message_id
@@ -352,7 +360,10 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
             user_id = int(key.split(":")[-1])
             user_data = await redis_handler.redis_client.hgetall(key)
             score = int(user_data.get('score', 0))
-            username = user_data.get('username', f"User_{user_id}")
+            # تطبيق html.escape على اسم المستخدم
+            username = html.escape(user_data.get('username', f"User_{user_id}")) # <--- html.escape
+            if username.startswith("User_"): # إذا لم يتم العثور على اسم مستخدم، لا تقم بتوسيع "User_..." باسم مستخدم حقيقي
+                pass # لا داعي لـ html.escape هنا مرة أخرى
 
             user_answers = {}
             for k, v in user_data.items():
@@ -370,35 +381,46 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
             continue
 
     sorted_participants = sorted(final_scores.items(), key=lambda item: item[1]['score'], reverse=True)
-    winner_id, winner_score, winner_username = (None, 0, "لا يوجد")
+    winner_id, winner_score, winner_username_escaped = (None, 0, "لا يوجد")
     if sorted_participants:
         winner_id, winner_data = sorted_participants[0]
-        winner_score, winner_username = winner_data['score'], winner_data['username']
+        winner_score, winner_username_escaped = winner_data['score'], winner_data['username'] # هنا `username` بالفعل تم عمل escape له
 
-    results_text = "🏆 **المسابقة انتهت! النتائج النهائية:** 🏆\n\n"
+    # رموز التحكم بالاتجاه
+    ltr = '\u202A'  # Left-to-right embedding
+    pdf = '\u202C'  # Pop directional formatting
+
+    results_text = "🏆 <b>المسابقة انتهت! النتائج النهائية:</b> 🏆\n\n" # <--- استخدام <b>
     if winner_id:
-        results_text += f"🎉 **الفائز**: {winner_username} بـ {winner_score} نقطة!\n\n"
+        # استخدام رموز الاتجاه لضمان الاتجاه الصحيح
+        results_text += f"🎉 <b>الفائز</b>: {ltr}{winner_username_escaped}{pdf} بـ {winner_score} نقطة!\n\n" # <--- استخدام <b> و ltr/pdf
     else:
         results_text += "😞 لم يشارك أحد في المسابقة أو لم يحصل أحد على نقاط.\n\n"
 
     if len(sorted_participants) > 0:
-        results_text += "🏅 **لوحة المتصدرين:**\n"
+        results_text += "🏅 <b>لوحة المتصدرين:</b>\n" # <--- استخدام <b>
         for i, (user_id, data) in enumerate(sorted_participants[:10]):
             rank_emoji = ""
             if i == 0: rank_emoji = "🥇 "
             elif i == 1: rank_emoji = "🥈 "
             elif i == 2: rank_emoji = "🥉 "
-            results_text += f"{rank_emoji}{i+1}. {data['username']}: {data['score']} نقطة\n"
+
+            # تطبيق رموز الاتجاه هنا: نجبر الكتلة الأولى (الرقم والاسم والنقاط) على أن تكون LTR
+            # ثم يأتي النص العربي "نقطة" بعدها بشكل طبيعي
+            results_text += f"{rank_emoji}{ltr}{i+1}. {data['username']}: {data['score']}{pdf} نقطة\n"
     else:
         results_text += "😔 لا توجد نتائج لعرضها.\n"
 
     try:
         logger.info(f"Worker: [{quiz_key}] Saving quiz history and updating user stats in SQLite DB: {stats_db_path}")
+        # هنا قد تحتاج إلى التأكد من أن حقل quiz_identifier موجود في جدول quiz_history
+        # يمكنك إضافة هذا السطر في ملف sqlite_handler.py في دالة إنشاء الجدول:
+        # CREATE TABLE IF NOT EXISTS quiz_history ( ... quiz_identifier TEXT, ... )
         quiz_history_id = await sqlite_handler.save_quiz_history(stats_db_path, quiz_identifier, total_questions, winner_id, winner_score)
 
         for user_id, data in final_scores.items():
             total_points = data['score']
-            username = data['username']
+            username = data['username'] # هنا `username` هو الاسم الذي تم عمل escape له بالفعل
             correct_answers_count = sum(1 for q_score in data['answers'].values() if q_score > 0)
             total_answered_questions_count = len(data['answers'])
             wrong_answers_count = total_answered_questions_count - correct_answers_count
@@ -410,7 +432,7 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
     except Exception as e:
         logger.error(f"Worker: [{quiz_key}] Failed to save quiz results to SQLite: {e}", exc_info=True)
 
-    message_data = {"text": results_text, "reply_markup": json.dumps({}), "parse_mode": "Markdown"}
+    message_data = {"text": results_text, "reply_markup": json.dumps({}), "parse_mode": "HTML"} # <--- تم التغيير إلى HTML
     try:
         if inline_message_id:
             message_data["inline_message_id"] = inline_message_id
@@ -430,19 +452,36 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
 
 async def main_loop():
     logger.info("Worker: Starting main loop...")
+    # Define the keywords to ignore
+    ignore_keywords = [
+        ":askquestion",
+        ":newpost",
+        ":Newpost",
+        ":stats",
+        ":leaderboard",
+        ":start"
+    ]
+
     while True:
         try:
-            active_quiz_keys = [key async for key in redis_handler.redis_client.scan_iter("Quiz:*:*")]
+            # Get all quiz keys
+            all_quiz_keys = [key async for key in redis_handler.redis_client.scan_iter("Quiz:*:*")]
 
-            if active_quiz_keys:
-                logger.info(f"Worker: Found {len(active_quiz_keys)} quiz keys to process: {active_quiz_keys}")
-                tasks = [process_active_quiz(key) for key in active_quiz_keys]
+            # Filter out keys containing the ignore keywords
+            active_quiz_keys_to_process = [
+                key for key in all_quiz_keys
+                if not any(keyword in key for keyword in ignore_keywords)
+            ]
+
+            if active_quiz_keys_to_process:
+                logger.info(f"Worker: Found {len(active_quiz_keys_to_process)} quiz keys to process: {active_quiz_keys_to_process}")
+                tasks = [process_active_quiz(key) for key in active_quiz_keys_to_process]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for i, result in enumerate(results):
                     if isinstance(result, Exception):
-                        logger.error(f"Worker: An error occurred while processing quiz {active_quiz_keys[i]}: {result}", exc_info=result)
+                        logger.error(f"Worker: An error occurred while processing quiz {active_quiz_keys_to_process[i]}: {result}", exc_info=result)
             else:
-                logger.debug("Worker: No active quizzes found. Waiting...")
+                logger.debug("Worker: No active quizzes (after filtering) found. Waiting...")
 
         except Exception as e:
             logger.error(f"Worker: An critical error occurred in the main loop: {e}", exc_info=True)
