@@ -11,6 +11,7 @@ class StartCompetitionRequest(BaseModel):
     category: Optional[str] = None # إضافة حقل الفئة هنا (سيكون اسم الفئة)
 
 
+
 class StopCompetitionRequest(BaseModel):
     bot_token: str
     quiz_identifier: str # Changed from channel_id
