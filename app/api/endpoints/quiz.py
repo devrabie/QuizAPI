@@ -192,7 +192,9 @@ async def submit_answer(request: quiz_models.SubmitAnswerRequest):
     quiz_status = await redis_handler.get_quiz_status(request.bot_token, quiz_unique_id)
     if not quiz_status or quiz_status.get("status") != "active":
         if quiz_status and quiz_status.get("status") == "stopping":
+            logger.warning(f"API: User {request.user_id} tried to submit answer for quiz {quiz_unique_id} which is stopping.")
             raise HTTPException(status_code=400, detail="المسابقة في طور الإيقاف حاليًا. لا يتم قبول إجابات جديدة.")
+        logger.warning(f"API: User {request.user_id} tried to submit answer for inactive quiz {quiz_unique_id}.")
         raise HTTPException(status_code=400, detail="لا توجد مسابقة نشطة أو المسابقة ليست في حالة نشطة.")
 
     current_question_id_in_redis = int(quiz_time.get("question_id", -1)) if quiz_time and quiz_time.get("question_id") else -1
