@@ -1,3 +1,5 @@
+# main_worker.py
+
 import asyncio
 import json
 from datetime import datetime, timedelta
@@ -236,7 +238,7 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             "parse_mode": "Markdown"
         }
 
-        logger.info(f"Worker: [{quiz_key}] Attempting to edit message for Q{next_index + 1} (ID: {next_question_id}).")
+        sent_message = None
         try:
             response = None
             if inline_message_id:
@@ -432,10 +434,24 @@ async def main_loop():
     logger.info("Worker: Starting main loop...")
     while True:
         try:
-            active_quiz_keys = [key async for key in redis_handler.redis_client.scan_iter("Quiz:*:*")]
+            # الخطوة 1: جلب جميع المفاتيح التي تبدأ بـ "Quiz:"
+            all_quiz_related_keys = [key async for key in redis_handler.redis_client.scan_iter("Quiz:*:*")]
+
+            # الخطوة 2: تصفية المفاتيح لمعالجة مفاتيح حالة المسابقة الرئيسية فقط
+            active_quiz_keys = []
+            for key in all_quiz_related_keys:
+                # تقسيم المفتاح بواسطة ":" للتحقق من عدد الأجزاء
+                # المفتاح الرئيسي للمسابقة يجب أن يكون بالصيغة "Quiz:bot_token:quiz_identifier"
+                # أي 3 أجزاء عند التقسيم بواسطة ":"
+                parts = key.split(':')
+                if len(parts) == 3 and parts[0] == 'Quiz':
+                    active_quiz_keys.append(key)
+                else:
+                    # هذه مفاتيح فرعية أو غير ذات صلة بحالة المسابقة الرئيسية، يمكننا تسجيلها للتصحيح
+                    logger.debug(f"Worker: Skipping non-main quiz key: {key} (parts: {len(parts)})")
 
             if active_quiz_keys:
-                logger.info(f"Worker: Found {len(active_quiz_keys)} quiz keys to process: {active_quiz_keys}")
+                logger.info(f"Worker: Found {len(active_quiz_keys)} *main* quiz keys to process: {active_quiz_keys}")
                 tasks = [process_active_quiz(key) for key in active_quiz_keys]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for i, result in enumerate(results):
