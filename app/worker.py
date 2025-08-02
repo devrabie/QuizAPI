@@ -216,7 +216,7 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             return
 
         # تطبيق html.escape على نص السؤال
-        base_question_text_for_redis = f"<b>السؤال {next_index + 1}</b>: {html.escape(question['question'])}" # <--- استخدام <b> و html.escape
+        base_question_text_for_redis = f"<b>السؤال {next_index + 1} </b>: {html.escape(question['question'])}" # <--- استخدام <b> و html.escape
 
         options = [html.escape(question['opt1']), html.escape(question['opt2']), html.escape(question['opt3']), html.escape(question['opt4'])] # <--- html.escape على الخيارات
         # تم تعديل هذا السطر لتضمين quiz_game_id (quiz_identifier) في callback_data
