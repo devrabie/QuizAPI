@@ -51,7 +51,7 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
     message_id = quiz_status.get("message_id")
 
     # تطبيق html.escape على النص الأساسي للسؤال
-    base_question_text_from_redis = html.escape(quiz_status.get("current_question_text", ""))
+    base_question_text_from_redis = quiz_status.get("current_question_text", "")
 
     if not all([bot_token, quiz_identifier, base_question_text_from_redis]):
         logger.warning(f"Worker: [{quiz_key}] Missing core data (token, identifier, or base_question_text). Skipping.")
@@ -216,9 +216,9 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             return
 
         # تطبيق html.escape على نص السؤال
-        base_question_text_for_redis = f"<b>السؤال {next_index + 1} </b>: {html.escape(question['question'])}" # <--- استخدام <b> و html.escape
+        base_question_text_for_redis = f"<b>السؤال  {next_index + 1} </b>:\n{question['question']}" # <--- استخدام <b> و html.escape
 
-        options = [html.escape(question['opt1']), html.escape(question['opt2']), html.escape(question['opt3']), html.escape(question['opt4'])] # <--- html.escape على الخيارات
+        options = [question['opt1'], question['opt2'], question['opt3'], question['opt4']]# <--- html.escape على الخيارات
         # تم تعديل هذا السطر لتضمين quiz_game_id (quiz_identifier) في callback_data
         quiz_identifier_for_callbacks = quiz_status.get("quiz_identifier")
         keyboard = {"inline_keyboard": [[{"text": opt, "callback_data": f"answer_{quiz_identifier_for_callbacks}_{next_question_id}_{i}"}] for i, opt in enumerate(options)]}
@@ -459,7 +459,8 @@ async def main_loop():
         ":Newpost",
         ":stats",
         ":leaderboard",
-        ":start"
+        ":start",
+        "Panel"
     ]
 
     while True:
