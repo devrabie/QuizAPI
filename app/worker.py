@@ -68,7 +68,7 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
         return
 
     new_text = (
-        f"❓ {base_question_text_from_redis}\n\n"
+        f"display❓ {base_question_text_from_redis}\n\n"
         f"👥 <b>المشاركون</b>: {participants}\n" # <--- استخدام <b> بدلاً من **
         f"⏳ <b>الوقت المتبقي</b>: {int(time_left)} ثانية" # <--- استخدام <b> بدلاً من **
     )
