@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timedelta
 import logging
 import os
-import html # <--- تم إضافة هذا الاستيراد
+import html
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -50,7 +50,9 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
     chat_id = quiz_status.get("chat_id")
     message_id = quiz_status.get("message_id")
 
-    # تطبيق html.escape على النص الأساسي للسؤال
+    # استرداد اسم الفئة للعرض من حالة المسابقة في Redis
+    category_display_name = quiz_status.get("category_display_name", "عامة")
+
     base_question_text_from_redis = quiz_status.get("current_question_text", "")
 
     if not all([bot_token, quiz_identifier, base_question_text_from_redis]):
@@ -67,10 +69,12 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
         logger.error(f"Worker: [{quiz_key}] Failed to scan for participants: {e}", exc_info=True)
         return
 
+    # بناء الرسالة الجديدة بما في ذلك اسم الفئة
     new_text = (
-        f"display❓ {base_question_text_from_redis}\n\n"
-        f"👥 <b>المشاركون</b>: {participants}\n" # <--- استخدام <b> بدلاً من **
-        f"⏳ <b>الوقت المتبقي</b>: {int(time_left)} ثانية" # <--- استخدام <b> بدلاً من **
+        f"❓ {base_question_text_from_redis}\n\n"
+        f"🏷️ <b>الفئة</b>: {html.escape(category_display_name)}\n" # <--- سطر جديد لعرض الفئة (مع escape)
+        f"👥 <b>المشاركون</b>: {participants}\n"
+        f"⏳ <b>الوقت المتبقي</b>: {int(time_left)} ثانية"
     )
 
     current_keyboard_str = quiz_status.get("current_keyboard")
@@ -81,7 +85,7 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
     message_data = {
         "text": new_text,
         "reply_markup": current_keyboard_str,
-        "parse_mode": "HTML" # <--- تم التغيير إلى HTML
+        "parse_mode": "HTML"
     }
 
     try:
@@ -97,7 +101,6 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
             logger.error(f"Worker: [{quiz_key}] No valid message identifier for editing.")
             return
 
-        # حل مشكلة 'bool' object has no attribute 'get'
         if response.get("ok") and response.get("result") is True:
             logger.debug(f"Worker: [{quiz_key}] Telegram reported message edited successfully (result=True), no new IDs to update.")
         elif not response.get("ok"):
@@ -106,8 +109,7 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
         else:
             logger.debug(f"Worker: [{quiz_key}] Successfully updated display message.")
 
-        # تحديث معرفات الرسالة في Redis بعد كل تحديث للرسالة
-        if response.get("result") and isinstance(response.get("result"), dict): # التحقق من أن 'result' هو قاموس
+        if response.get("result") and isinstance(response.get("result"), dict):
             updated_inline_message_id = response["result"].get("inline_message_id")
             updated_chat_id = response["result"].get("chat", {}).get("id")
             updated_message_id = response["result"].get("message_id")
@@ -187,7 +189,7 @@ async def process_active_quiz(quiz_key: str):
 
 async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotServiceAsync):
     current_index = int(quiz_status.get("current_index", -1))
-    question_ids_str = quiz_status.get("question_ids", "[]")
+    question_ids_str = quiz_status.get("question_ids", "[]") # قائمة معرفات الأسئلة التي تم جلبها مسبقاً حسب الفئة
 
     try:
         question_ids = json.loads(question_ids_str)
@@ -201,7 +203,8 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
     logger.info(f"Worker: [{quiz_key}] Handling next question logic. Current Index: {current_index}, Next Index: {next_index}, Total Qs: {len(question_ids)}")
 
     if next_index < len(question_ids):
-        next_question_id = question_ids[next_index]
+        next_question_id = question_ids[next_index] # جلب المعرف التالي من القائمة المفلترة
+
         questions_db_path = quiz_status.get("questions_db_path")
 
         if not questions_db_path:
@@ -209,27 +212,32 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             await end_quiz(quiz_key, quiz_status, telegram_bot)
             return
 
+        # جلب تفاصيل السؤال المحدد بواسطة ID، وليس بواسطة الفئة (الفئة تم التعامل معها سابقًا)
         question = await sqlite_handler.get_question_by_id(questions_db_path, next_question_id)
         if not question:
             logger.error(f"Worker: [{quiz_key}] Question ID {next_question_id} not found in DB '{questions_db_path}'. Ending quiz.")
             await end_quiz(quiz_key, quiz_status, telegram_bot)
             return
 
-        # تطبيق html.escape على نص السؤال
-        base_question_text_for_redis = f"<b>السؤال  {next_index + 1} </b>:\n{question['question']}" # <--- استخدام <b> و html.escape
+        base_question_text_for_redis = f"<b>السؤال  {next_index + 1} </b>:\n{question['question']}"
 
-        options = [question['opt1'], question['opt2'], question['opt3'], question['opt4']]# <--- html.escape على الخيارات
-        # تم تعديل هذا السطر لتضمين quiz_game_id (quiz_identifier) في callback_data
+        options = [question['opt1'], question['opt2'], question['opt3'], question['opt4']]
         quiz_identifier_for_callbacks = quiz_status.get("quiz_identifier")
         keyboard = {"inline_keyboard": [[{"text": opt, "callback_data": f"answer_{quiz_identifier_for_callbacks}_{next_question_id}_{i}"}] for i, opt in enumerate(options)]}
 
         time_per_question = int(quiz_status.get("time_per_question", 30))
         initial_participants_count_for_new_q = 0
         initial_time_display_for_new_q = time_per_question
+
+        # استرداد اسم الفئة للعرض
+        category_display_name = quiz_status.get("category_display_name", "عامة")
+
+        # بناء الرسالة بما في ذلك اسم الفئة
         full_new_question_message_text = (
             f"❓ {base_question_text_for_redis}\n\n"
-            f"👥 <b>المشاركون</b>: {initial_participants_count_for_new_q}\n" # <--- استخدام <b>
-            f"⏳ <b>الوقت المتبقي</b>: {initial_time_display_for_new_q} ثانية" # <--- استخدام <b>
+            f"🏷️ <b>الفئة</b>: {html.escape(category_display_name)}\n" # <--- سطر جديد لعرض الفئة
+            f"👥 <b>المشاركون</b>: {initial_participants_count_for_new_q}\n"
+            f"⏳ <b>الوقت المتبقي</b>: {initial_time_display_for_new_q} ثانية"
         )
 
         inline_message_id = quiz_status.get("inline_message_id")
@@ -239,7 +247,7 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
         message_data = {
             "text": full_new_question_message_text,
             "reply_markup": json.dumps(keyboard),
-            "parse_mode": "HTML" # <--- تم التغيير إلى HTML
+            "parse_mode": "HTML"
         }
 
         logger.info(f"Worker: [{quiz_key}] Attempting to edit message for Q{next_index + 1} (ID: {next_question_id}).")
@@ -258,7 +266,6 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
                 return
 
             logger.info(f"Worker: [{quiz_key}] Telegram API response for edit_message: {response}")
-            # حل مشكلة 'bool' object has no attribute 'get'
             if response.get("ok") and response.get("result") is True:
                 logger.debug(f"Worker: [{quiz_key}] Telegram reported message edited successfully (result=True), no new IDs to update.")
             elif not response.get("ok"):
@@ -268,8 +275,7 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
                     return
             logger.info(f"Worker: [{quiz_key}] Question {next_index + 1} (ID: {next_question_id}) sent/edited successfully.")
 
-            # تحديث معرفات الرسالة في Redis بعد كل تحديث للرسالة
-            if response.get("result") and isinstance(response.get("result"), dict): # التحقق من أن 'result' هو قاموس
+            if response.get("result") and isinstance(response.get("result"), dict):
                 updated_inline_message_id = response["result"].get("inline_message_id")
                 updated_chat_id = response["result"].get("chat", {}).get("id")
                 updated_message_id = response["result"].get("message_id")
@@ -297,7 +303,8 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             quiz_key, mapping={
                 "current_question_text": base_question_text_for_redis,
                 "current_keyboard": json.dumps(keyboard),
-                "current_index": next_index
+                "current_index": next_index,
+                "category_display_name": category_display_name # <--- تحديث اسم الفئة في حالة إعادة تعيين حالة المسابقة
             }
         )
 
@@ -334,8 +341,8 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
 
     if not stats_db_path:
         logger.error(f"Worker: [{quiz_key}] 'stats_db_path' not found in quiz status. Cannot save results to SQLite.")
-        results_text = "🏆 <b>المسابقة انتهت!</b> 🏆\n\nحدث خطأ في حفظ النتائج. يرجى مراجعة سجلات الخادم." # <--- استخدام <b>
-        message_data = {"text": results_text, "reply_markup": json.dumps({}), "parse_mode": "HTML"} # <--- تم التغيير إلى HTML
+        results_text = "🏆 <b>المسابقة انتهت!</b> 🏆\n\nحدث خطأ في حفظ النتائج. يرجى مراجعة سجلات الخادم."
+        message_data = {"text": results_text, "reply_markup": json.dumps({}), "parse_mode": "HTML"}
         try:
             if inline_message_id:
                 message_data["inline_message_id"] = inline_message_id
@@ -360,10 +367,7 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
             user_id = int(key.split(":")[-1])
             user_data = await redis_handler.redis_client.hgetall(key)
             score = int(user_data.get('score', 0))
-            # تطبيق html.escape على اسم المستخدم
-            username = html.escape(user_data.get('username', f"User_{user_id}")) # <--- html.escape
-            if username.startswith("User_"): # إذا لم يتم العثور على اسم مستخدم، لا تقم بتوسيع "User_..." باسم مستخدم حقيقي
-                pass # لا داعي لـ html.escape هنا مرة أخرى
+            username = html.escape(user_data.get('username', f"User_{user_id}"))
 
             user_answers = {}
             for k, v in user_data.items():
@@ -384,43 +388,37 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
     winner_id, winner_score, winner_username_escaped = (None, 0, "لا يوجد")
     if sorted_participants:
         winner_id, winner_data = sorted_participants[0]
-        winner_score, winner_username_escaped = winner_data['score'], winner_data['username'] # هنا `username` بالفعل تم عمل escape له
+        winner_score, winner_username_escaped = winner_data['score'], winner_data['username']
 
     # رموز التحكم بالاتجاه
-    ltr = '\u202A'  # Left-to-right embedding
-    pdf = '\u202C'  # Pop directional formatting
+    ltr = '\u202A'
+    pdf = '\u202C'
 
-    results_text = "🏆 <b>المسابقة انتهت! النتائج النهائية:</b> 🏆\n\n" # <--- استخدام <b>
+    results_text = "🏆 <b>المسابقة انتهت! النتائج النهائية:</b> 🏆\n\n"
     if winner_id:
-        # استخدام رموز الاتجاه لضمان الاتجاه الصحيح
-        results_text += f"🎉 <b>الفائز</b>: {ltr}{winner_username_escaped}{pdf} بـ {winner_score} نقطة!\n\n" # <--- استخدام <b> و ltr/pdf
+        results_text += f"🎉 <b>الفائز</b>: {ltr}{winner_username_escaped}{pdf} بـ {winner_score} نقطة!\n\n"
     else:
         results_text += "😞 لم يشارك أحد في المسابقة أو لم يحصل أحد على نقاط.\n\n"
 
     if len(sorted_participants) > 0:
-        results_text += "🏅 <b>لوحة المتصدرين:</b>\n" # <--- استخدام <b>
+        results_text += "🏅 <b>لوحة المتصدرين:</b>\n"
         for i, (user_id, data) in enumerate(sorted_participants[:10]):
             rank_emoji = ""
             if i == 0: rank_emoji = "🥇 "
             elif i == 1: rank_emoji = "🥈 "
             elif i == 2: rank_emoji = "🥉 "
 
-            # تطبيق رموز الاتجاه هنا: نجبر الكتلة الأولى (الرقم والاسم والنقاط) على أن تكون LTR
-            # ثم يأتي النص العربي "نقطة" بعدها بشكل طبيعي
             results_text += f"{rank_emoji}{ltr}{i+1}. {data['username']}: {data['score']}{pdf} نقطة\n"
     else:
         results_text += "😔 لا توجد نتائج لعرضها.\n"
 
     try:
         logger.info(f"Worker: [{quiz_key}] Saving quiz history and updating user stats in SQLite DB: {stats_db_path}")
-        # هنا قد تحتاج إلى التأكد من أن حقل quiz_identifier موجود في جدول quiz_history
-        # يمكنك إضافة هذا السطر في ملف sqlite_handler.py في دالة إنشاء الجدول:
-        # CREATE TABLE IF NOT EXISTS quiz_history ( ... quiz_identifier TEXT, ... )
         quiz_history_id = await sqlite_handler.save_quiz_history(stats_db_path, quiz_identifier, total_questions, winner_id, winner_score)
 
         for user_id, data in final_scores.items():
             total_points = data['score']
-            username = data['username'] # هنا `username` هو الاسم الذي تم عمل escape له بالفعل
+            username = data['username']
             correct_answers_count = sum(1 for q_score in data['answers'].values() if q_score > 0)
             total_answered_questions_count = len(data['answers'])
             wrong_answers_count = total_answered_questions_count - correct_answers_count
@@ -432,7 +430,7 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
     except Exception as e:
         logger.error(f"Worker: [{quiz_key}] Failed to save quiz results to SQLite: {e}", exc_info=True)
 
-    message_data = {"text": results_text, "reply_markup": json.dumps({}), "parse_mode": "HTML"} # <--- تم التغيير إلى HTML
+    message_data = {"text": results_text, "reply_markup": json.dumps({}), "parse_mode": "HTML"}
     try:
         if inline_message_id:
             message_data["inline_message_id"] = inline_message_id

@@ -21,26 +21,29 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
 
     await sqlite_handler.create_tables(request.stats_db_path)
 
-    # --- تعديل: جلب الأسئلة بناءً على الفئة المُمررة ---
-    category_to_fetch = request.category # سيصل هنا كـ None أو اسم الفئة أو 'General'
+    category_to_fetch = request.category # الفئة التي تم تمريرها من الواجهة (قد تكون None أو 'General' أو اسم فئة محدد)
 
+    # --- هذا هو المكان الذي يتم فيه تحديد الفئة وجلب الأسئلة لأول مرة ---
     if category_to_fetch == 'General':
         questions = await sqlite_handler.get_questions_general(request.questions_db_path, request.total_questions)
         if not questions:
             logger.error(f"API: No general questions found in {request.questions_db_path} for total_questions {request.total_questions}")
             raise HTTPException(status_code=404, detail="لم يتم العثور على أي أسئلة عامة في قاعدة البيانات.")
+        display_category_name = "عامة" # الاسم الذي سيعرض للمستخدم
     elif category_to_fetch: # إذا كانت فئة محددة (ليست None وليست 'General')
         questions = await sqlite_handler.get_questions_by_category(request.questions_db_path, category_to_fetch, request.total_questions)
         if not questions:
             logger.error(f"API: No questions found in category '{category_to_fetch}' for total_questions {request.total_questions}")
             raise HTTPException(status_code=404, detail=f"لم يتم العثور على أي أسئلة في فئة '{category_to_fetch}'. يرجى اختيار فئة أخرى أو إضافة أسئلة.")
-    else: # إذا لم يتم تحديد فئة (يجب أن لا يحدث مع التدفق الجديد)
+        display_category_name = category_to_fetch # اسم الفئة نفسه للعرض
+    else: # إذا لم يتم تحديد فئة، نعود إلى الأسئلة العامة
         logger.error(f"API: Start request for quiz {quiz_unique_id} missing category info. Defaulting to general questions.")
         questions = await sqlite_handler.get_questions_general(request.questions_db_path, request.total_questions)
         if not questions:
             raise HTTPException(status_code=404, detail="لم يتم العثور على أي أسئلة في قاعدة البيانات (لم يتم تحديد فئة).")
+        display_category_name = "عامة" # الاسم الذي سيعرض للمستخدم في حالة الافتراض
 
-    # ... (بقية الكود هو نفسه من التحديثات السابقة)
+    # يتم استخراج معرفات الأسئلة التي تم جلبها (والتي هي بالفعل من الفئة المطلوبة)
     question_ids = [q['id'] for q in questions]
 
     current_quiz_status = await redis_handler.get_quiz_status(request.bot_token, quiz_unique_id)
@@ -54,9 +57,9 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         raise HTTPException(status_code=400, detail=f"المسابقة ليست في حالة انتظار (pending). حالتها الحالية: {current_quiz_status.get('status')}.")
 
     telegram_bot = TelegramBotServiceAsync(request.bot_token)
-    first_question = questions[0]
+    first_question = questions[0] # أول سؤال من القائمة المفلترة
 
-    base_question_text_for_redis = f"**السؤال 1**: {first_question['question']}"
+    base_question_text_for_redis = f"<b>السؤال 1</b>:{first_question['question']}"
     options = [first_question['opt1'], first_question['opt2'], first_question['opt3'], first_question['opt4']]
     keyboard = {
         "inline_keyboard": [
@@ -73,10 +76,13 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         current_participants = 0
 
     initial_time_display = request.question_delay
+
+    # بناء الرسالة الأولى بما في ذلك اسم الفئة
     full_initial_message_text = (
         f"❓ {base_question_text_for_redis}\n\n"
-        f"👥 **المشاركون**: {current_participants}\n"
-        f"⏳ **الوقت المتبقي**: {initial_time_display} ثانية"
+        f"🏷️ <b>الفئة</b>: {display_category_name}\n" # <--- سطر جديد لعرض الفئة
+        f"👥<b>المشاركون</b>: {current_participants}\n"
+        f"⏳<b>الوقت المتبقي</b>: {initial_time_display} ثانية"
     )
 
     message_identifier_data = await redis_handler.redis_client.hgetall(redis_handler.quiz_key(request.bot_token, quiz_unique_id))
@@ -87,7 +93,7 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     message_params = {
         "text": full_initial_message_text,
         "reply_markup": json.dumps(keyboard),
-        "parse_mode": "Markdown"
+        "parse_mode": "HTML"
     }
 
     sent_message = None
@@ -127,7 +133,7 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         quiz_unique_id=quiz_unique_id,
         questions_db_path=request.questions_db_path,
         stats_db_path=request.stats_db_path,
-        question_ids=question_ids,
+        question_ids=question_ids, # قائمة معرفات الأسئلة التي تم تصفيتها بالفئة
         time_per_question=request.question_delay,
         creator_id=existing_quiz_state.get('creator_id', 0)
     )
@@ -137,7 +143,8 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     data_to_set_in_redis = {
         "current_question_text": base_question_text_for_redis,
         "current_keyboard": json.dumps(keyboard),
-        "status": "active"
+        "status": "active",
+        "category_display_name": display_category_name # <--- إضافة اسم الفئة للعرض في Redis
     }
 
     if inline_message_id is not None:
