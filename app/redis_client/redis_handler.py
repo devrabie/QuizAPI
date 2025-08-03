@@ -54,6 +54,7 @@ async def start_quiz(bot_token: str, quiz_unique_id: str, questions_db_path: str
 
 async def get_quiz_status(bot_token: str, quiz_unique_id: str):
     """يسترجع حالة مسابقة معينة من Redis."""
+    # ملاحظة: هذه الدالة لم تعد تُستخدم مباشرة في quiz_api.py، بل get_quiz_status_by_key
     key = quiz_key(bot_token, quiz_unique_id)
     return await redis_client.hgetall(key)
 
@@ -82,17 +83,13 @@ async def has_answered(bot_token: str, quiz_unique_id: str, question_id: int, us
     key = answered_key(bot_token, quiz_unique_id, question_id, user_id)
     return await redis_client.exists(key)
 
-async def record_answer(bot_token: str, quiz_unique_id: str, question_id: int, user_id: int, username: str, score: int, time_per_question: int) -> bool:
+async def record_answer(bot_token: str, quiz_unique_id: str, question_id: int, user_id: int, username: str, score: int, time_per_question: int):
     """
     يسجل إجابة المستخدم ويزيد نقاطه.
-    يعيد True إذا كانت هذه هي المرة الأولى التي يجيب فيها هذا المستخدم في هذه المسابقة ككل.
+    لم تعد ترجع `is_new_participant_in_quiz` لأن هذا يتم إدارته من جانب PHP عند الانضمام.
     """
     answered_key_str = answered_key(bot_token, quiz_unique_id, question_id, user_id)
     answers_key = quiz_answers_key(bot_token, quiz_unique_id, user_id)
-
-    # تحقق مما إذا كان هذا هو أول مرة يسجل فيها هذا المستخدم إجابة في هذه المسابقة
-    # (أي هل key QuizAnswers:{bot_token}:{quiz_unique_id}:{user_id} موجود بالفعل)
-    is_new_participant_in_quiz = not await redis_client.exists(answers_key)
 
     async with redis_client.pipeline() as pipe:
         # تعيين مفتاح Answered:{...} بصلاحية لمنع الإجابات المتعددة على نفس السؤال
@@ -104,9 +101,10 @@ async def record_answer(bot_token: str, quiz_unique_id: str, question_id: int, u
         pipe.hset(answers_key, f"answers.{question_id}", score)
         await pipe.execute()
 
-    logger.debug(f"Redis: Recorded answer for user {user_id} on Q{question_id} (score: {score}) in quiz {quiz_unique_id}. Was new participant: {is_new_participant_in_quiz}.")
+    logger.debug(f"Redis: Recorded answer for user {user_id} on Q{question_id} (score: {score}) in quiz {quiz_unique_id}.")
 
-    return is_new_participant_in_quiz
+    # لم نعد نرجع True/False هنا، لأن المنطق يعتمد الآن على قائمة `players` في Redis.
+    return None
 
 async def end_quiz(bot_token: str, quiz_unique_id: str):
     """
