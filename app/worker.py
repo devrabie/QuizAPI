@@ -169,7 +169,7 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
     """
     دالة لتحديث رسالة عرض السؤال النشط في المسابقة.
     """
-    UPDATE_INTERVAL_SECONDS = 7
+    UPDATE_INTERVAL_SECONDS = 4.6
     now = datetime.now()
 
     if not force_update:
@@ -502,7 +502,7 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
 
         # إضافة التوقيع إلى الرسالة النهائية
         if signature_text:
-            results_text += f"\n\n{signature_text}"
+            results_text += f"\n{signature_text}"
 
 
         try:
@@ -523,7 +523,7 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
         except Exception as e:
             logger.error(f"Worker: [{quiz_key}] Failed to save quiz results to SQLite: {e}", exc_info=True)
 
-        message_data = {"text": results_text, "reply_markup": json.dumps({}), "parse_mode": "HTML"}
+        message_data = {"text": results_text, "reply_markup": json.dumps({}), "parse_mode": "HTML", "disable_web_page_preview": True}
         await _send_telegram_update(quiz_key, telegram_bot, message_data, quiz_status)
         logger.info(f"Worker: [{quiz_key}] Final results message sent to Telegram.")
 
@@ -567,7 +567,7 @@ async def main_loop():
         except Exception as e:
             logger.error(f"Worker: An critical error occurred in the main loop: {e}", exc_info=True)
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(1.5)
 
 if __name__ == "__main__":
     try:
