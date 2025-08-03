@@ -502,7 +502,7 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
 
         # إضافة التوقيع إلى الرسالة النهائية
         if signature_text:
-            results_text += f"\n\n{html.escape(signature_text)}"
+            results_text += f"\n\n{signature_text}"
 
 
         try:
