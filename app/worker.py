@@ -92,7 +92,7 @@ async def update_pending_display(quiz_key: str, quiz_status: dict, telegram_bot:
     دالة لتحديث رسالة حالة المسابقة عندما تكون في حالة "pending" (انتظار اللاعبين).
     تُستخدم لإزالة الحاجة إلى تحديث العرض من بوت PHP.
     """
-    UPDATE_INTERVAL_SECONDS = 6
+    UPDATE_INTERVAL_SECONDS = 4
     now = datetime.now()
 
     if not force_update:
