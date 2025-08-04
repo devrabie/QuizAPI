@@ -22,11 +22,13 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     quiz_unique_id = request.quiz_identifier
     quiz_key = redis_handler.quiz_key(request.bot_token, quiz_unique_id)
 
+    # تأكد من إنشاء جداول الإحصائيات إذا لم تكن موجودة
     await sqlite_handler.create_tables(request.stats_db_path)
 
+    # تحديد الفئة وجلب الأسئلة
     category_to_fetch = request.category
     questions = []
-    display_category_name = "عامة"
+    display_category_name = "عامة" # الاسم الذي سيعرض للمستخدم
 
     if category_to_fetch == 'General':
         questions = await sqlite_handler.get_questions_general(request.questions_db_path, request.total_questions)
@@ -49,7 +51,7 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
 
     question_ids = [q['id'] for q in questions]
 
-    current_quiz_status = await redis_handler.get_quiz_status_by_key(quiz_key)
+    current_quiz_status = await redis_handler.get_quiz_status_by_key(quiz_key) # استخدم get_quiz_status_by_key لتقليل الاستعلام
 
     if not current_quiz_status:
         logger.error(f"API: Start request for non-existent quiz {quiz_unique_id}. Check if quiz was created via inline query.")
@@ -60,7 +62,7 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         raise HTTPException(status_code=400, detail=f"المسابقة ليست في حالة انتظار (pending). حالتها الحالية: {current_quiz_status.get('status')}.")
 
     telegram_bot = TelegramBotServiceAsync(request.bot_token)
-    first_question = questions[0]
+    first_question = questions[0] # أول سؤال من القائمة المفلترة
 
     base_question_text_for_redis = f"<b>السؤال 1</b>:\n{first_question['question']}"
     options = [first_question['opt1'], first_question['opt2'], first_question['opt3'], first_question['opt4']]
@@ -72,6 +74,7 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         ]
     }
 
+    # حساب عدد المشاركين الموجودين بالفعل في قائمة 'players'
     players_json = current_quiz_status.get('players', '[]')
     try:
         initial_participants_count = len(json.loads(players_json))
@@ -81,6 +84,7 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
 
     initial_time_display = request.question_delay
 
+    # بناء الرسالة الأولى بما في ذلك اسم الفئة
     full_initial_message_text = (
         f"❓ {base_question_text_for_redis}\n\n"
         f"🏷️ <b>الفئة</b>: {html.escape(display_category_name)}\n"
@@ -88,6 +92,7 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         f"⏳ <b>الوقت المتبقي</b>: {initial_time_display} ثانية"
     )
 
+    # جلب معرفات الرسالة من Redis
     inline_message_id = current_quiz_status.get('inline_message_id')
     chat_id_from_redis = current_quiz_status.get('chat_id')
     message_id_from_redis = current_quiz_status.get('message_id')
@@ -98,44 +103,24 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         "parse_mode": "HTML"
     }
 
-    sent_message_result = None # هنا سيتم تخزين نتيجة استجابة تيليجرام
+    sent_message = None
     try:
         if inline_message_id:
             message_params["inline_message_id"] = inline_message_id
-            sent_message_result = await asyncio.wait_for(telegram_bot.edit_inline_message(message_params), timeout=10.0)
-            logger.info(f"API: Telegram edit_inline_message response for first question: {sent_message_result}")
+            sent_message = await asyncio.wait_for(telegram_bot.edit_inline_message(message_params), timeout=10.0)
+            logger.info(f"API: Telegram edit_inline_message response for first question: {sent_message}")
         elif chat_id_from_redis and message_id_from_redis:
             message_params["chat_id"] = chat_id_from_redis
             message_params["message_id"] = message_id_from_redis
-            sent_message_result = await asyncio.wait_for(telegram_bot.edit_message(message_params), timeout=10.0)
-            logger.info(f"API: Telegram edit_message response for first question: {sent_message_result}")
+            sent_message = await asyncio.wait_for(telegram_bot.edit_message(message_params), timeout=10.0)
+            logger.info(f"API: Telegram edit_message response for first question: {sent_message}")
         else:
             logger.error(f"API: No valid message identifier found for quiz {quiz_unique_id}. Cannot send/edit message.")
             raise HTTPException(status_code=500, detail="خطأ داخلي: لم يتم العثور على معرّف الرسالة لبدء المسابقة.")
 
-        if not sent_message_result.get("ok"):
-            logger.error(f"API: Failed to update message in Telegram: {sent_message_result.get('description')}")
-            raise HTTPException(status_code=500, detail=f"فشل في تعديل الرسالة الأولى في تيليجرام: {sent_message_result.get('description')}")
-
-        # **التحسين: حفظ معرفات الرسالة من استجابة API**
-        # هذا يضمن أن لدينا أحدث وأدق معرف للرسالة بعد التعديل.
-        if sent_message_result.get("result"):
-            updated_inline_message_id = sent_message_result["result"].get("inline_message_id")
-            updated_chat_id = sent_message_result["result"].get("chat", {}).get("id")
-            updated_message_id = sent_message_result["result"].get("message_id")
-
-            update_redis_map = {}
-            if updated_inline_message_id:
-                update_redis_map["inline_message_id"] = updated_inline_message_id
-                logger.debug(f"API: Updated inline_message_id in Redis from Telegram response: {updated_inline_message_id}")
-            elif updated_chat_id and updated_message_id:
-                update_redis_map["chat_id"] = str(updated_chat_id)
-                update_redis_map["message_id"] = str(updated_message_id)
-                logger.debug(f"API: Updated chat_id/message_id in Redis from Telegram response: {updated_chat_id}/{updated_message_id}")
-
-            if update_redis_map:
-                await redis_handler.redis_client.hset(quiz_key, mapping=update_redis_map)
-
+        if not sent_message.get("ok"):
+            logger.error(f"API: Failed to update message in Telegram: {sent_message.get('description')}")
+            raise HTTPException(status_code=500, detail=f"فشل في تعديل الرسالة الأولى في تيليجرام: {sent_message.get('description')}")
 
     except asyncio.TimeoutError:
         logger.error(f"API: Timed out while sending/editing first message for quiz {quiz_unique_id}.")
@@ -144,6 +129,7 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         logger.error(f"API: Error sending/editing first message for quiz {quiz_unique_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"خطأ أثناء تعديل الرسالة الأولى للمسابقة: {e}")
 
+    # تهيئة المسابقة في Redis (تتضمن الآن participant_count)
     await redis_handler.start_quiz(
         bot_token=request.bot_token,
         quiz_unique_id=quiz_unique_id,
@@ -152,18 +138,20 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         question_ids=question_ids,
         time_per_question=request.question_delay,
         creator_id=int(current_quiz_status.get('creator_id', 0)),
-        initial_participant_count=initial_participants_count
+        initial_participant_count=initial_participants_count # **تمرير العداد المحسوب**
     )
 
+    # تحديث حقول المسابقة بعد بدء أول سؤال (خاصة للعرض)
     data_to_set_in_redis = {
         "current_question_text": base_question_text_for_redis,
         "current_keyboard": json.dumps(keyboard),
-        "status": "active",
+        "status": "active", # الآن المسابقة نشطة
         "category_display_name": display_category_name,
-        "current_index": 0
+        "current_index": 0 # بدء من السؤال الأول
     }
     await redis_handler.redis_client.hset(quiz_key, mapping=data_to_set_in_redis)
 
+    # إعداد مؤقت السؤال الأول
     end_time = datetime.now() + timedelta(seconds=request.question_delay)
     await redis_handler.set_current_question(request.bot_token, quiz_unique_id, first_question['id'], end_time)
 
@@ -188,6 +176,7 @@ async def stop_competition(request: quiz_models.StopCompetitionRequest):
         logger.warning(f"API: [{quiz_key}] {detail_msg}")
         raise HTTPException(status_code=400, detail=detail_msg)
 
+    # تغيير حالة المسابقة إلى "stopping" ليقوم الـ worker بإنهاءها
     await redis_handler.redis_client.hset(quiz_key, "status", "stopping")
     logger.info(f"API: Competition {quiz_key} set to 'stopping'. Worker will finalize cleanup and results.")
     return {"message": "Competition is being stopped. Results will be posted shortly."}
@@ -209,9 +198,11 @@ async def submit_answer(request: quiz_models.SubmitAnswerRequest):
         logger.warning(f"API: User {request.user_id} tried to submit answer for inactive quiz {quiz_unique_id}.")
         raise HTTPException(status_code=400, detail="لا توجد مسابقة نشطة أو المسابقة ليست في حالة نشطة.")
 
+    # === **التحسين الجديد: التحقق من أن المستخدم مشارك رسميًا** ===
     players_json = quiz_status.get('players', '[]')
     try:
         players = json.loads(players_json)
+        # قم بإنشاء مجموعة (set) بمعرفات اللاعبين الموجودين لتحسين أداء البحث
         participant_ids = {p['id'] for p in players if 'id' in p}
 
         if request.user_id not in participant_ids:
@@ -221,6 +212,7 @@ async def submit_answer(request: quiz_models.SubmitAnswerRequest):
     except json.JSONDecodeError:
         logger.error(f"API: Failed to decode players JSON for quiz {quiz_unique_id}: {players_json}. Denying answer due to data corruption.")
         raise HTTPException(status_code=500, detail="خطأ داخلي: فشل في معالجة قائمة المشاركين.")
+    # =============================================================
 
     quiz_time_key = redis_handler.quiz_time_key(request.bot_token, quiz_unique_id)
     quiz_time = await redis_handler.redis_client.hgetall(quiz_time_key)
@@ -258,6 +250,8 @@ async def submit_answer(request: quiz_models.SubmitAnswerRequest):
 
     time_per_question = int(quiz_status.get('time_per_question', 30))
 
+    # تسجيل الإجابة وتحديث نقاط المستخدم في Redis
+    # لم نعد نزيد participant_count هنا، لأنه يتم تحديثه فقط عند الانضمام
     await redis_handler.record_answer(
         bot_token=request.bot_token,
         quiz_unique_id=quiz_unique_id,
@@ -289,6 +283,9 @@ async def competition_status(bot_token: str, quiz_identifier: str):
         except ValueError:
             logger.warning(f"API: Invalid end_time format in Redis for quiz {bot_token}:{quiz_identifier}")
 
+    # عدد المشاركين يتم سحبه مباشرة من 'participant_count' الذي يتم تحديثه عند الانضمام
+    # إذا كانت المسابقة في حالة 'pending'، فإن 'players' في Redis هي المصدر الحقيقي
+    # وإذا كانت 'active'، فإن 'participant_count' هو المصدر (محدث من 'players')
     participants = int(quiz_status.get("participant_count", 0))
     if quiz_status.get("status") == "pending" and quiz_status.get('players'):
         try:
