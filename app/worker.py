@@ -520,10 +520,12 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
             results_text += "😞 لم يشارك أحد في المسابقة أو لم يحصل أحد على نقاط.\n\n"
 
         # إحصائيات المشاركة الجديدة
+        results_text += f"{BLOCKQUOTE_OPEN_TAG}"
         results_text += f"📊 <b>إحصائيات المشاركة:</b>\n"
         results_text += f"• إجمالي اللاعبين المسجلين: {total_registered_players}\n"
         results_text += f"• عدد من شارك بإجابات: {total_participants_who_answered}\n"
         results_text += f"• عدد لم يشارك بإجابات: {not_answered_count}\n\n"
+        results_text += f"{BLOCKQUOTE_CLOSE_TAG}"
 
 
         if len(sorted_participants) > 0:
