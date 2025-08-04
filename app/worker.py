@@ -257,7 +257,7 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
     additional_buttons = []
     quiz_identifier = quiz_status.get("quiz_identifier")
     creator_user_id = quiz_status.get("creator_id")
-    additional_buttons.append([{"text": '➡️ لوحة المتصدرين', "callback_data": f"show_leaderboard|{quiz_identifier}|{creator_user_id}"}])
+    # additional_buttons.append([{"text": '➡️ لوحة المتصدرين', "callback_data": f"show_leaderboard|{quiz_identifier}|{creator_user_id}"}])
 
     updated_keyboard = {"inline_keyboard": current_keyboard["inline_keyboard"] + additional_buttons}
 
