@@ -305,7 +305,7 @@ async def process_active_quiz(quiz_key: str):
             await update_pending_display(quiz_key, quiz_status, telegram_bot)
             return
 
-        if status not in ["active", "initializing"]:
+        if status not in ["active"]:
             logger.debug(f"Worker: [{quiz_key}] Status is '{status}'. Skipping question progression.")
             return
 
