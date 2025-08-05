@@ -130,6 +130,7 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         raise HTTPException(status_code=500, detail=f"خطأ أثناء تعديل الرسالة الأولى للمسابقة: {e}")
 
     # تهيئة المسابقة في Redis (تتضمن الآن participant_count)
+    # **تمرير max_players إلى start_quiz ليكون متاحًا في حالة المسابقة**
     await redis_handler.start_quiz(
         bot_token=request.bot_token,
         quiz_unique_id=quiz_unique_id,
@@ -138,7 +139,8 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         question_ids=question_ids,
         time_per_question=request.question_delay,
         creator_id=int(current_quiz_status.get('creator_id', 0)),
-        initial_participant_count=initial_participants_count # **تمرير العداد المحسوب**
+        initial_participant_count=initial_participants_count, # **تمرير العداد المحسوب**
+        max_players=request.max_players # **إضافة هذا السطر**
     )
 
     # تحديث حقول المسابقة بعد بدء أول سؤال (خاصة للعرض)
@@ -147,7 +149,8 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         "current_keyboard": json.dumps(keyboard),
         "status": "active", # الآن المسابقة نشطة
         "category_display_name": display_category_name,
-        "current_index": 0 # بدء من السؤال الأول
+        "current_index": 0, # بدء من السؤال الأول
+        "max_players": request.max_players # **تأكيد وجودها في حالة المسابقة النشطة**
     }
     await redis_handler.redis_client.hset(quiz_key, mapping=data_to_set_in_redis)
 
@@ -191,14 +194,15 @@ async def submit_answer(request: quiz_models.SubmitAnswerRequest):
 
     quiz_status = await redis_handler.get_quiz_status_by_key(quiz_key)
 
-    if not quiz_status or quiz_status.get("status") != "active":
+    if not quiz_status or quiz_status.get("status") not in ["active", "pending"]: # تسمح بالإجابة حتى لو كانت pending (مفيدة لاختبارات)
         if quiz_status and quiz_status.get("status") == "stopping":
             logger.warning(f"API: User {request.user_id} tried to submit answer for quiz {quiz_unique_id} which is stopping.")
             raise HTTPException(status_code=400, detail="المسابقة في طور الإيقاف حاليًا. لا يتم قبول إجابات جديدة.")
         logger.warning(f"API: User {request.user_id} tried to submit answer for inactive quiz {quiz_unique_id}.")
         raise HTTPException(status_code=400, detail="لا توجد مسابقة نشطة أو المسابقة ليست في حالة نشطة.")
 
-    # === **التحسين الجديد: التحقق من أن المستخدم مشارك رسميًا** ===
+    max_players = int(quiz_status.get("max_players", 12)) # استرداد الحد الأقصى للمشاركين
+
     players_json = quiz_status.get('players', '[]')
     try:
         players = json.loads(players_json)
@@ -206,13 +210,30 @@ async def submit_answer(request: quiz_models.SubmitAnswerRequest):
         participant_ids = {p['id'] for p in players if 'id' in p}
 
         if request.user_id not in participant_ids:
-            logger.warning(f"API: User {request.user_id} is not a registered participant for quiz {quiz_unique_id}. Denying answer.")
-            raise HTTPException(status_code=403, detail="لا يمكنك الإجابة على الأسئلة ما لم تكن مشاركًا مسجلاً في المسابقة. يرجى الانضمام أولاً.")
+            # **المنطق الجديد: السماح بالانضمام بعد البدء**
+            current_participant_count = len(participant_ids)
+            if current_participant_count < max_players:
+                logger.info(f"API: User {request.user_id} joining quiz {quiz_unique_id} mid-game. Current participants: {current_participant_count}/{max_players}.")
+                new_player = {
+                    "id": request.user_id,
+                    "username": request.username,
+                    "joined_at": datetime.now().isoformat(),
+                    "quiz_identifier": quiz_unique_id,
+                    "bot_token": request.bot_token
+                }
+                players.append(new_player)
+                # تحديث قائمة اللاعبين في Redis
+                await redis_handler.redis_client.hset(quiz_key, "players", json.dumps(players))
+                # تحديث عداد المشاركين (مهم جداً للعرض والعمليات الأخرى)
+                await redis_handler.redis_client.hset(quiz_key, "participant_count", len(players))
+                logger.info(f"API: User {request.user_id} successfully joined quiz {quiz_unique_id}. New count: {len(players)}.")
+            else:
+                logger.warning(f"API: User {request.user_id} tried to join quiz {quiz_unique_id} but max players ({max_players}) reached. Denying answer.")
+                raise HTTPException(status_code=403, detail=f"المسابقة ممتلئة حاليًا ({max_players} مشارك). لا يمكن الانضمام أو الإجابة.")
 
     except json.JSONDecodeError:
         logger.error(f"API: Failed to decode players JSON for quiz {quiz_unique_id}: {players_json}. Denying answer due to data corruption.")
         raise HTTPException(status_code=500, detail="خطأ داخلي: فشل في معالجة قائمة المشاركين.")
-    # =============================================================
 
     quiz_time_key = redis_handler.quiz_time_key(request.bot_token, quiz_unique_id)
     quiz_time = await redis_handler.redis_client.hgetall(quiz_time_key)
@@ -251,7 +272,6 @@ async def submit_answer(request: quiz_models.SubmitAnswerRequest):
     time_per_question = int(quiz_status.get('time_per_question', 30))
 
     # تسجيل الإجابة وتحديث نقاط المستخدم في Redis
-    # لم نعد نزيد participant_count هنا، لأنه يتم تحديثه فقط عند الانضمام
     await redis_handler.record_answer(
         bot_token=request.bot_token,
         quiz_unique_id=quiz_unique_id,
@@ -284,16 +304,7 @@ async def competition_status(bot_token: str, quiz_identifier: str):
             logger.warning(f"API: Invalid end_time format in Redis for quiz {bot_token}:{quiz_identifier}")
 
     # عدد المشاركين يتم سحبه مباشرة من 'participant_count' الذي يتم تحديثه عند الانضمام
-    # إذا كانت المسابقة في حالة 'pending'، فإن 'players' في Redis هي المصدر الحقيقي
-    # وإذا كانت 'active'، فإن 'participant_count' هو المصدر (محدث من 'players')
     participants = int(quiz_status.get("participant_count", 0))
-    if quiz_status.get("status") == "pending" and quiz_status.get('players'):
-        try:
-            participants = len(json.loads(quiz_status['players']))
-        except json.JSONDecodeError:
-            logger.warning(f"API: Failed to decode players JSON for quiz {quiz_identifier} in pending state. Using 0 participants.")
-            participants = 0
-
 
     return {
         "status": quiz_status.get("status", "inactive"),

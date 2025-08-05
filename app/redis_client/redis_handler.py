@@ -30,12 +30,27 @@ def answered_key(bot_token: str, quiz_unique_id: str, question_id: int, user_id:
     return f"Answered:{bot_token}:{quiz_unique_id}:{question_id}:{user_id}"
 
 
-async def start_quiz(bot_token: str, quiz_unique_id: str, questions_db_path: str, stats_db_path: str, question_ids: list, time_per_question: int, creator_id: int, initial_participant_count: int = 0):
+async def start_quiz(
+        bot_token: str,
+        quiz_unique_id: str,
+        questions_db_path: str,
+        stats_db_path: str,
+        question_ids: list,
+        time_per_question: int,
+        creator_id: int,
+        initial_participant_count: int = 0,
+        max_players: int = 0 # <--- إضافة المعامل max_players هنا
+):
     """
     يبدأ مسابقة جديدة في Redis.
     initial_participant_count هو عدد المشاركين في قائمة الانتظار قبل بدء المسابقة.
+    max_players هو الحد الأقصى لعدد المشاركين المسموح به.
     """
     key = quiz_key(bot_token, quiz_unique_id)
+
+    # جلب الحالة الموجودة إذا كانت موجودة للحفاظ على القيم (مثل inline_message_id)
+    existing_data = await redis_client.hgetall(key)
+
     quiz_data = {
         "status": "initializing", # سيتم تغييره إلى "active" بواسطة API بعد إرسال السؤال الأول
         "quiz_identifier": quiz_unique_id,
@@ -47,10 +62,20 @@ async def start_quiz(bot_token: str, quiz_unique_id: str, questions_db_path: str
         "bot_token": bot_token,
         "questions_db_path": questions_db_path,
         "stats_db_path": stats_db_path,
-        "participant_count": initial_participant_count # **التحسين: إضافة عداد المشاركين الأولي**
+        "participant_count": initial_participant_count, # عداد المشاركين الأولي
+        "max_players": max_players # <--- تخزين max_players في Redis
     }
-    await redis_client.hset(key, mapping=quiz_data) # استخدام mapping لتمرير القاموس بالكامل
-    logger.info(f"Redis: Quiz {key} initialized with status 'initializing' and {initial_participant_count} participants.")
+
+    # دمج البيانات الموجودة مع البيانات الجديدة
+    merged_data = {**existing_data, **quiz_data}
+    await redis_client.hset(key, mapping=merged_data)
+    await redis_client.expire(key, timedelta(hours=24)) # صلاحية المسابقة لمدة 24 ساعة
+
+    quiz_time_key_str = quiz_time_key(bot_token, quiz_unique_id)
+    await redis_client.delete(quiz_time_key_str) # مسح أي مؤقت سابق
+
+    logger.info(f"Redis: Quiz {key} initialized with status 'initializing', {initial_participant_count} participants, and max {max_players} players.")
+
 
 async def get_quiz_status(bot_token: str, quiz_unique_id: str):
     """يسترجع حالة مسابقة معينة من Redis."""
