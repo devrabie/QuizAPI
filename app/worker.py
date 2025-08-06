@@ -508,7 +508,15 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
         winner_id, winner_score, winner_username_escaped = (None, 0, "لا يوجد")
         if sorted_participants:
             winner_id, winner_data = sorted_participants[0]
-            winner_score, winner_username_escaped = winner_data['score'], winner_data['username']
+            # winner_score, winner_username_escaped = winner_data['score'], winner_data['username']
+            get_user_info=await telegram_bot.get_chat_member(chat_id=winner_id, user_id=winner_id)
+            if get_user_info and get_user_info.get("user")['username']:
+
+                winner_score = f"@{get_user_info['user']['username']}"
+            else:
+                winner_score = f"<a href='tg://user?id={winner_id}'>{get_user_info['user']['first_name']}</a>"
+
+
 
         ltr = '\u202A'
         pdf = '\u202C'

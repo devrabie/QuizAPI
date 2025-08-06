@@ -78,3 +78,13 @@ class TelegramBotServiceAsync :
             "show_alert": show_alert
         }
         return await self._post("answerCallbackQuery", data)
+
+
+
+    async def get_chat_member(self, chat_id: int, user_id: int) -> dict:
+
+        data = {
+            "chat_id": chat_id,
+            "user_id": user_id
+        }
+        return await self._post("getChatMember", data)
