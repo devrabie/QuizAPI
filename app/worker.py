@@ -567,7 +567,9 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
         except Exception as e:
             logger.error(f"Worker: [{quiz_key}] Failed to save quiz results to SQLite: {e}", exc_info=True)
 
-        message_data = {"text": results_text, "reply_markup": json.dumps({}), "parse_mode": "HTML"}
+        message_data = {"text": results_text, "reply_markup": json.dumps({}),
+                        'disable_web_page_preview': True,
+                        "parse_mode": "HTML"}
         await _send_telegram_update(quiz_key, telegram_bot, message_data, quiz_status)
         logger.info(f"Worker: [{quiz_key}] Final results message sent to Telegram.")
 
