@@ -446,10 +446,6 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
             logger.error(f"Worker: [{quiz_key}] Cannot end quiz, bot_token or quiz_identifier is missing. Releasing lock and exiting.")
             return
 
-        # inline_message_id = quiz_status.get("inline_message_id") # لم نعد نستخدمها مباشرة هنا
-        # chat_id = quiz_status.get("chat_id") # لم نعد نستخدمها مباشرة هنا
-        # message_id = quiz_status.get("message_id") # لم نعد نستخدمها مباشرة هنا
-
         if not stats_db_path:
             results_text = "🏆 <b>المسابقة انتهت!</b> 🏆\n\nحدث خطأ في حفظ النتائج. يرجى مراجعة سجلات الخادم."
             message_data = {"text": results_text, "reply_markup": json.dumps({}), "parse_mode": "HTML"}
@@ -509,13 +505,32 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
         if sorted_participants:
             winner_id, winner_data = sorted_participants[0]
             winner_score = winner_data['score']
-            get_user_info=await telegram_bot.get_chat_member(chat_id=winner_id, user_id=winner_id)
-            if get_user_info and get_user_info.get("user")['username']:
 
-                winner_username_escaped  = f"@{get_user_info['user']['username']}"
+            get_user_info = None
+            try:
+                # هذا سيعمل إذا كان winner_id هو user_id للمستخدم
+                get_user_info = await telegram_bot.get_chat_member(chat_id=winner_id, user_id=winner_id)
+            except Exception as e:
+                logger.warning(f"Worker: [{quiz_key}] Could not fetch winner info for {winner_id} via get_chat: {e}")
+
+            if get_user_info and get_user_info.get("ok"):
+                user_api_data = get_user_info.get("result", {})
+                if user_api_data:
+                    if user_api_data.get("username"):
+                        winner_username_escaped = f"@{html.escape(user_api_data['username'])}"
+                    elif user_api_data.get("first_name"):
+                        # استخدم الرابط القابل للنقر
+                        winner_username_escaped = f"<a href='tg://user?id={user_api_data['id']}'>{user_api_data['first_name']}</a>"
+                    else:
+                        # إذا لم يتم العثور على اسم مستخدم أو اسم أول، استخدم الاسم من Redis
+                        winner_username_escaped = winner_data.get('username', f"User_{winner_id}")
+                else:
+                    # إذا كانت بيانات الـ API فارغة، استخدم الاسم من Redis
+                    winner_username_escaped = winner_data.get('username', f"User_{winner_id}")
             else:
-                winner_username_escaped  = f"<a href='tg://user?id={winner_id}'>{get_user_info['user']['first_name']}</a>"
-
+                # إذا فشل جلب المعلومات من Telegram API (not ok أو get_user_info هو None)،
+                # استخدم الاسم الذي تم جلبه من Redis
+                winner_username_escaped = winner_data.get('username', f"User_{winner_id}")
 
 
         ltr = '\u202A'
