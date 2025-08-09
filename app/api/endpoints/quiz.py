@@ -127,6 +127,7 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         "status": "active", # The quiz is now active
         "category_display_name": display_category_name,
         "current_index": 0,
+        "mid_update_sent": "0" ,
         "max_players": max_players_from_status
     }
     await redis_handler.redis_client.hset(quiz_key, mapping=data_to_set_in_redis)
