@@ -291,7 +291,8 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
     """
     دالة لتحديث رسالة عرض السؤال النشط في المسابقة.
     """
-    UPDATE_INTERVAL_SECONDS = 1.0
+    # ## <-- التغيير هنا: زدنا الفاصل الزمني لتقليل عدد التحديثات
+    UPDATE_INTERVAL_SECONDS = 2.5
     now = datetime.now()
 
     if not force_update:
@@ -309,7 +310,8 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
         return
 
     await redis_handler.redis_client.hset(quiz_key, "last_display_update", now.isoformat())
-    logger.info(f"Worker: [{quiz_key}] Proceeding with active display update (force_update={force_update}).")
+    # ## <-- التغيير هنا: تم تعديل مستوى التسجيل لتقليل الضوضاء في السجلات
+    logger.debug(f"Worker: [{quiz_key}] Proceeding with active display update (force_update={force_update}).")
 
     category_display_name = quiz_status.get("category_display_name", "عامة")
     base_question_text_from_redis = quiz_status.get("current_question_text", "")
@@ -322,7 +324,8 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
         f"❓ {base_question_text_from_redis}\n\n"
         f"🏷️ <b>الفئة</b>: {html.escape(category_display_name)}\n"
         f"👥 <b>المشاركون</b>: {participants}\n"
-        f"⏳ <b>الوقت المتبقي</b>: {int(time_left)} ثانية"
+        # ## <-- التغيير هنا: تقريب الوقت لأعلى دائمًا ليكون العرض أفضل للمستخدم
+        f"⏳ <b>الوقت المتبقي</b>: {int(time_left + 0.99)} ثانية"
     )
 
     current_keyboard_str = quiz_status.get("current_keyboard")
@@ -331,11 +334,8 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
 
     current_keyboard = json.loads(current_keyboard_str)
 
-    additional_buttons = []
-    quiz_identifier = quiz_status.get("quiz_identifier")
-    creator_user_id = quiz_status.get("creator_id")
-
-    updated_keyboard = {"inline_keyboard": current_keyboard["inline_keyboard"] + additional_buttons}
+    # الكيبورد الأصلي يكفي
+    updated_keyboard = {"inline_keyboard": current_keyboard["inline_keyboard"]}
 
     message_data = {
         "text": new_text,
@@ -718,7 +718,6 @@ async def main_loop():
             ]
 
             if active_quiz_keys_to_process:
-                logger.debug(f"Worker: Found {len(active_quiz_keys_to_process)} quiz keys to process.")
                 tasks = [process_active_quiz(key) for key in active_quiz_keys_to_process]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for i, result in enumerate(results):
@@ -737,13 +736,13 @@ async def main_loop():
                                 )
                         except Exception as inner_e:
                             logger.error(f"Worker: Failed to send admin notification for general processing error: {inner_e}")
-            else:
-                logger.debug("Worker: No active quizzes (after filtering) found. Waiting...")
 
         except Exception as e:
             logger.error(f"Worker: An critical error occurred in the main loop: {e}", exc_info=True)
 
-        await asyncio.sleep(1)
+        # ## <-- التغيير هنا: هذا هو أهم تغيير لتحقيق الدقة!
+        # بتقليل فترة الانتظار، نضمن اكتشاف انتهاء وقت السؤال بشكل شبه فوري.
+        await asyncio.sleep(0.2)
 
 if __name__ == "__main__":
     try:
