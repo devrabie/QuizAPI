@@ -29,8 +29,8 @@ ADMIN_TELEGRAM_ID = 6198033039 # قم بتغيير هذا إلى معرف الم
 # هذا سيساعد في التعامل مع "Too Many Requests"
 # لكل بوت: { "last_call_time": datetime, "tokens": float, "last_retry_after": datetime }
 bot_rate_limiter = {}
-RATE_LIMIT_TOKENS_PER_SECOND = 3.0
-RATE_LIMIT_BUCKET_SIZE = 15
+RATE_LIMIT_TOKENS_PER_SECOND = 2.0
+RATE_LIMIT_BUCKET_SIZE = 10
 
 # تعريف علامات HTML لطي النص
 BLOCKQUOTE_OPEN_TAG = "<blockquote expandable>"
@@ -55,11 +55,14 @@ async def send_admin_notification(bot_token: str, message: str):
         if len(message) > 4000:
             message = message[:4000] + "\n... (الرسالة مختصرة)"
 
-        await admin_bot.send_message(
-            chat_id=ADMIN_TELEGRAM_ID,
-            text=f"🚨 <b>إشعار خطأ من البوت</b> 🚨\n\n{message}",
-            parse_mode="HTML"
-        )
+        # **التصحيح الرئيسي هنا:**
+        # بناءً على ملف telegram_bot.py الخاص بك، دالة send_message تتوقع قاموسًا (data) كمعامل.
+        message_data = {
+            "chat_id": ADMIN_TELEGRAM_ID,
+            "text": f"🚨 <b>إشعار خطأ من البوت</b> 🚨\n\n{message}",
+            "parse_mode": "HTML"
+        }
+        await admin_bot.send_message(message_data) # تمرير القاموس بالكامل
         logger.info(f"Admin notification sent to {ADMIN_TELEGRAM_ID}.")
     except Exception as e:
         logger.error(f"Failed to send admin notification to {ADMIN_TELEGRAM_ID}: {e}", exc_info=True)
@@ -144,7 +147,6 @@ async def _send_telegram_update(quiz_key: str, telegram_bot: TelegramBotServiceA
 
         if not response.get("ok"):
             desc = response.get("description", "")
-            logger.error(f"Worker: [{quiz_key}] Telegram reported failure to update display: {desc}")
 
             critical_error = False
             error_reason = ""
@@ -161,12 +163,22 @@ async def _send_telegram_update(quiz_key: str, telegram_bot: TelegramBotServiceA
             elif "chat not found" in desc:
                 critical_error = True
                 error_reason = "المحادثة غير موجودة أو تم حذفها."
+            elif "message is not modified" in desc:
+                # هذا الخطأ ليس حرجاً، ونقلل مستوى التسجيل له
+                logger.debug(f"Worker: [{quiz_key}] Telegram reported: {desc}")
+                return # لا داعي لإرسال إشعار أو تغيير الحالة
             elif "Too Many Requests" in desc:
                 retry_after = response.get("parameters", {}).get("retry_after", 5)
                 logger.warning(f"Worker: [{quiz_key}] Too Many Requests for bot {bot_token}. Retrying after {retry_after}s.")
                 bot_rate_limiter[bot_token]["last_retry_after"] = now + timedelta(seconds=retry_after)
-                # لا نوقف المسابقة هنا، فقط نؤجل المحاولة
                 return
+            else:
+                # أخطاء أخرى غير معروفة أو لم يتم التعامل معها
+                logger.error(f"Worker: [{quiz_key}] Telegram reported failure to update display: {desc}")
+                # قد ترغب في اعتبار الأخطاء الأخرى "حرجة" أو لا، حسب سياساتك
+                # critical_error = True
+                # error_reason = f"خطأ غير متوقع من Telegram API: {desc}"
+
 
             if critical_error:
                 logger.warning(f"Worker: [{quiz_key}] Critical Telegram error ({error_reason}). Setting quiz to 'stopping'.")
@@ -190,6 +202,7 @@ async def _send_telegram_update(quiz_key: str, telegram_bot: TelegramBotServiceA
         logger.warning(f"Worker: [{quiz_key}] Timed out while trying to send Telegram update.")
     except Exception as e:
         logger.error(f"Worker: [{quiz_key}] Failed to send Telegram update due to an exception: {e}", exc_info=True)
+        # إرسال إشعار هنا لأي استثناءات غير متوقعة
         await send_admin_notification(
             bot_token,
             f"<b>خطأ غير متوقع أثناء تحديث الرسالة للمسابقة:</b> {quiz_key}\n"
@@ -607,7 +620,6 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
                 else:
                     winner_username_escaped = winner_data.get('username', f"User_{winner_id}")
             else:
-                # **هنا تم التصحيح: إزالة الاقتباس المفرد غير المغلق**
                 winner_username_escaped = winner_data.get('username', f"User_{winner_id}")
 
 
