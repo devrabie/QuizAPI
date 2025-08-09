@@ -21,12 +21,16 @@ except ImportError:
 
 bot_instances = {}
 
+# **إعدادات البوت**
+# معرف تيليجرام الخاص بالمشرف لاستقبال الإشعارات
+ADMIN_TELEGRAM_ID = 6198033039 # قم بتغيير هذا إلى معرف المشرف الحقيقي
+
 # **التحسين: قاموس لتتبع معدل الطلبات لكل بوت باستخدام Token Bucket / Leaky Bucket**
 # هذا سيساعد في التعامل مع "Too Many Requests"
 # لكل بوت: { "last_call_time": datetime, "tokens": float, "last_retry_after": datetime }
 bot_rate_limiter = {}
-RATE_LIMIT_TOKENS_PER_SECOND = 1.0 # مثال: 1 توكن/ثانية لكل بوت. يمكن زيادته إلى 2-3 لـ editMessage (حوالي 60 طلب/دقيقة)
-RATE_LIMIT_BUCKET_SIZE = 5.0      # حجم الجردل الأقصى (عدد الطلبات التي يمكن تخزينها فجأة)
+RATE_LIMIT_TOKENS_PER_SECOND = 3.0
+RATE_LIMIT_BUCKET_SIZE = 15
 
 # تعريف علامات HTML لطي النص
 BLOCKQUOTE_OPEN_TAG = "<blockquote expandable>"
@@ -36,6 +40,30 @@ def get_telegram_bot(token: str) -> TelegramBotServiceAsync:
     if token not in bot_instances:
         bot_instances[token] = TelegramBotServiceAsync(token)
     return bot_instances[token]
+
+async def send_admin_notification(bot_token: str, message: str):
+    """
+    يرسل رسالة إشعار إلى معرف المشرف المحدد.
+    """
+    if not ADMIN_TELEGRAM_ID:
+        logger.warning("Admin Telegram ID is not configured. Cannot send admin notification.")
+        return
+
+    admin_bot = get_telegram_bot(bot_token)
+    try:
+        # التأكد من عدم تجاوز طول الرسالة المسموح به في تيليجرام (4096 حرف)
+        if len(message) > 4000:
+            message = message[:4000] + "\n... (الرسالة مختصرة)"
+
+        await admin_bot.send_message(
+            chat_id=ADMIN_TELEGRAM_ID,
+            text=f"🚨 <b>إشعار خطأ من البوت</b> 🚨\n\n{message}",
+            parse_mode="HTML"
+        )
+        logger.info(f"Admin notification sent to {ADMIN_TELEGRAM_ID}.")
+    except Exception as e:
+        logger.error(f"Failed to send admin notification to {ADMIN_TELEGRAM_ID}: {e}", exc_info=True)
+
 
 async def _is_api_call_allowed(bot_token: str, wait_for_tokens: bool = False) -> bool:
     """
@@ -54,6 +82,7 @@ async def _is_api_call_allowed(bot_token: str, wait_for_tokens: bool = False) ->
 
     # إذا طلب تيليجرام منا الانتظار، نلتزم بذلك
     if (now - bucket["last_retry_after"]).total_seconds() < 0: # هذا يعني أن هناك قيمة في المستقبل
+        logger.debug(f"Worker: Rate limit for bot {bot_token}. Still in retry_after period.")
         return False
 
     # إضافة توكنات للجردل بناءً على الوقت المنقضي
@@ -69,7 +98,8 @@ async def _is_api_call_allowed(bot_token: str, wait_for_tokens: bool = False) ->
         wait_time = (1.0 - bucket["tokens"]) / RATE_LIMIT_TOKENS_PER_SECOND
         logger.debug(f"Worker: Rate limit for bot {bot_token}. Waiting {wait_time:.2f}s for tokens.")
         await asyncio.sleep(wait_time)
-        bucket["tokens"] = 0.0 # استنفذنا التوكن بعد الانتظار
+        # بعد الانتظار، يجب أن يكون لدينا توكن واحد على الأقل
+        bucket["tokens"] = max(0.0, bucket["tokens"] - 1.0 + wait_time * RATE_LIMIT_TOKENS_PER_SECOND) # إعادة حساب التوكنات بعد الانتظار ومحاولة الحصول على توكن
         return True
     else:
         return False
@@ -81,7 +111,7 @@ async def _send_telegram_update(quiz_key: str, telegram_bot: TelegramBotServiceA
     تتعامل مع أخطاء API وتحديث حالة المسابقة.
     """
     bot_token = quiz_status.get("bot_token")
-    if not await _is_api_call_allowed(bot_token, wait_for_tokens=True): # حاول الحصول على توكن، انتظر إذا لزم الأمر
+    if not await _is_api_call_allowed(bot_token, wait_for_tokens=True):
         logger.debug(f"Worker: [{quiz_key}] Telegram update skipped/delayed due to rate limit for bot {bot_token}.")
         return
 
@@ -92,7 +122,6 @@ async def _send_telegram_update(quiz_key: str, telegram_bot: TelegramBotServiceA
 
     try:
         response = None
-        # تحديد ما إذا كانت الرسالة inline أو رسالة عادية
         if inline_message_id:
             message_data["inline_message_id"] = inline_message_id
             response = await asyncio.wait_for(telegram_bot.edit_inline_message(message_data), timeout=10.0)
@@ -101,43 +130,79 @@ async def _send_telegram_update(quiz_key: str, telegram_bot: TelegramBotServiceA
             message_data["message_id"] = message_id
             response = await asyncio.wait_for(telegram_bot.edit_message(message_data), timeout=10.0)
         else:
-            logger.error(f"Worker: [{quiz_key}] No valid message identifier (inline_message_id OR chat_id/message_id) for editing. Cannot send update.")
-            # إذا لم يكن هناك معرف رسالة، نضع المسابقة في حالة "stopping"
+            error_msg = f"No valid message identifier (inline_message_id OR chat_id/message_id) for editing."
+            logger.error(f"Worker: [{quiz_key}] {error_msg} Cannot send update.")
             await redis_handler.redis_client.hset(quiz_key, "status", "stopping")
+            # إرسال إشعار للمشرف
+            await send_admin_notification(
+                bot_token,
+                f"<b>خطأ حرج في المسابقة:</b> {quiz_key}\n"
+                f"السبب: {error_msg}\n"
+                f"المسابقة تم إيقافها."
+            )
             return
 
         if not response.get("ok"):
             desc = response.get("description", "")
-            if "message is not modified" not in desc:
-                logger.error(f"Worker: [{quiz_key}] Telegram reported failure to update display: {desc}")
-                # **التحسين: التعامل مع الأخطاء الحرجة**
-                # إذا كانت الرسالة غير صالحة أو تم حظر البوت، نوقف المسابقة
-                if "MESSAGE_ID_INVALID" in desc or "bot was blocked by the user" in desc or "chat not found" in desc:
-                    logger.warning(f"Worker: [{quiz_key}] Critical Telegram error ({desc}). Setting quiz to 'stopping'.")
-                    await redis_handler.redis_client.hset(quiz_key, "status", "stopping")
-                elif "Too Many Requests" in desc:
-                    retry_after = response.get("parameters", {}).get("retry_after", 5) # استخراج وقت الانتظار
-                    logger.warning(f"Worker: [{quiz_key}] Too Many Requests for bot {bot_token}. Retrying after {retry_after}s.")
-                    # تحديث وقت الانتظار في Rate Limiter للجردل هذا البوت
-                    bot_rate_limiter[bot_token]["last_retry_after"] = now + timedelta(seconds=retry_after)
-                    # يجب أن لا يحاول البوت إرسال طلبات لنفس البوت حتى ينتهي وقت الانتظار
+            logger.error(f"Worker: [{quiz_key}] Telegram reported failure to update display: {desc}")
+
+            critical_error = False
+            error_reason = ""
+
+            if "message to edit not found" in desc:
+                critical_error = True
+                error_reason = "الرسالة التي يتم تعديلها غير موجودة (قد تكون حُذفت)."
+            elif "MESSAGE_ID_INVALID" in desc:
+                critical_error = True
+                error_reason = "معرف الرسالة غير صالح."
+            elif "bot was blocked by the user" in desc:
+                critical_error = True
+                error_reason = "البوت تم حظره من قبل المستخدم."
+            elif "chat not found" in desc:
+                critical_error = True
+                error_reason = "المحادثة غير موجودة أو تم حذفها."
+            elif "Too Many Requests" in desc:
+                retry_after = response.get("parameters", {}).get("retry_after", 5)
+                logger.warning(f"Worker: [{quiz_key}] Too Many Requests for bot {bot_token}. Retrying after {retry_after}s.")
+                bot_rate_limiter[bot_token]["last_retry_after"] = now + timedelta(seconds=retry_after)
+                # لا نوقف المسابقة هنا، فقط نؤجل المحاولة
+                return
+
+            if critical_error:
+                logger.warning(f"Worker: [{quiz_key}] Critical Telegram error ({error_reason}). Setting quiz to 'stopping'.")
+                await redis_handler.redis_client.hset(quiz_key, "status", "stopping")
+                # إرسال إشعار للمشرف بالخطأ الحرج
+                await send_admin_notification(
+                    bot_token,
+                    f"<b>خطأ حرج في المسابقة:</b> {quiz_key}\n"
+                    f"معرف الرسالة: <code>{message_id}</code>\n"
+                    f"معرف المحادثة: <code>{chat_id}</code>\n"
+                    f"السبب: {error_reason}\n"
+                    f"وصف تيليجرام: {html.escape(desc)}\n"
+                    f"المسابقة تم إيقافها."
+                )
         else:
             logger.debug(f"Worker: [{quiz_key}] Successfully updated display message.")
-            # إعادة ضبط وقت last_retry_after عند النجاح
             if bot_token in bot_rate_limiter:
-                bot_rate_limiter[bot_token]["last_retry_after"] = now # أو now - timedelta(seconds=1)
+                bot_rate_limiter[bot_token]["last_retry_after"] = now
 
     except asyncio.TimeoutError:
         logger.warning(f"Worker: [{quiz_key}] Timed out while trying to send Telegram update.")
     except Exception as e:
         logger.error(f"Worker: [{quiz_key}] Failed to send Telegram update due to an exception: {e}", exc_info=True)
+        await send_admin_notification(
+            bot_token,
+            f"<b>خطأ غير متوقع أثناء تحديث الرسالة للمسابقة:</b> {quiz_key}\n"
+            f"السبب: {html.escape(str(e))}\n"
+            f"الرجاء التحقق من سجلات الخادم."
+        )
 
 
 async def update_pending_display(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotServiceAsync, force_update: bool = False):
     """
     دالة لتحديث رسالة حالة المسابقة عندما تكون في حالة "pending" (انتظار اللاعبين).
     """
-    UPDATE_INTERVAL_SECONDS = 5
+    UPDATE_INTERVAL_SECONDS = 2.0
     now = datetime.now()
 
     if not force_update:
@@ -150,8 +215,8 @@ async def update_pending_display(quiz_key: str, quiz_status: dict, telegram_bot:
                 logger.warning(f"Worker: [{quiz_key}] Could not parse last_display_update timestamp: {last_update_str}")
 
     bot_token = quiz_status.get("bot_token")
-    if not await _is_api_call_allowed(bot_token): # لا ننتظر هنا، نكتشف لاحقاً إذا كان الطلب بطيئاً
-        logger.debug(f"Worker: [{quiz_key}] Pending display update skipped due to GLOBAL rate limit for bot {bot_token}.")
+    if not await _is_api_call_allowed(bot_token, wait_for_tokens=True):
+        logger.debug(f"Worker: [{quiz_key}] Pending display update delayed due to rate limit for bot {bot_token}.")
         return
 
     await redis_handler.redis_client.hset(quiz_key, "last_display_update", now.isoformat())
@@ -190,7 +255,6 @@ async def update_pending_display(quiz_key: str, quiz_status: dict, telegram_bot:
         ]
     }
 
-    # تعطيل زر الانضمام إذا وصل العدد الأقصى
     if players_count >= max_players:
         for row_idx, row in enumerate(buttons["inline_keyboard"]):
             for btn_idx, button in enumerate(row):
@@ -214,7 +278,7 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
     """
     دالة لتحديث رسالة عرض السؤال النشط في المسابقة.
     """
-    UPDATE_INTERVAL_SECONDS = 4
+    UPDATE_INTERVAL_SECONDS = 1.0
     now = datetime.now()
 
     if not force_update:
@@ -227,8 +291,8 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
                 logger.warning(f"Worker: [{quiz_key}] Could not parse last_display_update timestamp: {last_update_str}")
 
     bot_token = quiz_status.get("bot_token")
-    if not await _is_api_call_allowed(bot_token):
-        logger.debug(f"Worker: [{quiz_key}] Active display update skipped due to GLOBAL rate limit for bot {bot_token}.")
+    if not await _is_api_call_allowed(bot_token, wait_for_tokens=True):
+        logger.debug(f"Worker: [{quiz_key}] Active display update delayed due to rate limit for bot {bot_token}.")
         return
 
     await redis_handler.redis_client.hset(quiz_key, "last_display_update", now.isoformat())
@@ -257,7 +321,6 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
     additional_buttons = []
     quiz_identifier = quiz_status.get("quiz_identifier")
     creator_user_id = quiz_status.get("creator_id")
-    # additional_buttons.append([{"text": '➡️ لوحة المتصدرين', "callback_data": f"show_leaderboard|{quiz_identifier}|{creator_user_id}"}])
 
     updated_keyboard = {"inline_keyboard": current_keyboard["inline_keyboard"] + additional_buttons}
 
@@ -303,7 +366,14 @@ async def process_active_quiz(quiz_key: str):
         if status == "pending":
             logger.debug(f"Worker: [{quiz_key}] Status is 'pending'. Updating display for waiting players.")
             await update_pending_display(quiz_key, quiz_status, telegram_bot)
+
+            current_status = await redis_handler.redis_client.hget(quiz_key, "status")
+            if current_status == "stopping":
+                logger.info(f"Worker: [{quiz_key}] Quiz status changed to 'stopping' after pending display update. Aborting current processing.")
+                return
+
             return
+
 
         if status not in ["active"]:
             logger.debug(f"Worker: [{quiz_key}] Status is '{status}'. Skipping question progression.")
@@ -323,7 +393,12 @@ async def process_active_quiz(quiz_key: str):
                     time_left = (end_time - datetime.now()).total_seconds()
                     logger.debug(f"Worker: [{quiz_key}] Timer active. {time_left:.1f}s left. Calling display updater.")
                     await update_question_display(quiz_key, quiz_status, telegram_bot, time_left)
-                    return
+
+                    current_status = await redis_handler.redis_client.hget(quiz_key, "status")
+                    if current_status == "stopping":
+                        logger.info(f"Worker: [{quiz_key}] Quiz status changed to 'stopping' after display update. Aborting current question progression.")
+                        return
+
             except (ValueError, TypeError):
                 logger.error(f"Worker: [{quiz_key}] Invalid end_time format: {quiz_time.get('end')}. Forcing next question.")
                 should_process_next_question = True
@@ -332,6 +407,11 @@ async def process_active_quiz(quiz_key: str):
             should_process_next_question = True
 
         if should_process_next_question:
+            current_status = await redis_handler.redis_client.hget(quiz_key, "status")
+            if current_status == "stopping":
+                logger.info(f"Worker: [{quiz_key}] Quiz status is 'stopping'. Aborting next question progression.")
+                return
+
             await handle_next_question(quiz_key, quiz_status, telegram_bot)
 
     finally:
@@ -400,6 +480,13 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
         logger.info(f"Worker: [{quiz_key}] Attempting to edit message for Q{next_index + 1} (ID: {next_question_id}).")
         await _send_telegram_update(quiz_key, telegram_bot, message_data, quiz_status)
 
+        current_status = await redis_handler.redis_client.hget(quiz_key, "status")
+        if current_status == "stopping":
+            logger.info(f"Worker: [{quiz_key}] Quiz status changed to 'stopping' after attempting to edit message. Aborting next question setup.")
+            await end_quiz(quiz_key, quiz_status, telegram_bot)
+            return
+
+
         end_time = datetime.now() + timedelta(seconds=time_per_question)
 
         bot_token = quiz_status.get("bot_token")
@@ -438,7 +525,6 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
         bot_token = quiz_status.get("bot_token")
         quiz_identifier = quiz_status.get("quiz_identifier")
         stats_db_path = quiz_status.get("stats_db_path")
-        # جلب نص التوقيع
         signature_text = quiz_status.get("signature_text", "بـوت تـحدي الاسئلة ❓ (https://t.me/nniirrbot)")
 
 
@@ -457,8 +543,7 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
 
         logger.info(f"Worker: [{quiz_key}] Calculating results from Redis.")
         final_scores = {}
-        # إحصائيات للمشاركين
-        total_participants_who_answered = 0 # عدد المشاركين الذين قدموا إجابة واحدة على الأقل (حتى لو كانت خاطئة)
+        total_participants_who_answered = 0
 
         async for key in redis_handler.redis_client.scan_iter(f"QuizAnswers:{bot_token}:{quiz_identifier}:*"):
             try:
@@ -478,7 +563,7 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
 
                 final_scores[user_id] = {'score': score, 'username': username, 'answers': user_answers}
 
-                if len(user_answers) > 0: # إذا أجاب المستخدم على سؤال واحد على الأقل
+                if len(user_answers) > 0:
                     total_participants_who_answered += 1
 
                 logger.debug(f"Worker: [{quiz_key}] Collected results for user {user_id}: score={score}, username={username}")
@@ -486,7 +571,6 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
                 logger.warning(f"Worker: [{quiz_key}] Could not parse user data from answer key '{key}': {e}")
                 continue
 
-        # جلب قائمة اللاعبين المسجلين من حالة المسابقة (من حقل 'players')
         registered_players_json = quiz_status.get('players', '[]')
         try:
             registered_players = json.loads(registered_players_json)
@@ -495,9 +579,8 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
             logger.warning(f"Worker: [{quiz_key}] Could not decode 'players' JSON for registered participants.")
             total_registered_players = 0
 
-        # عدد اللاعبين المسجلين الذين لم يقدموا أي إجابة
         not_answered_count = total_registered_players - total_participants_who_answered
-        if not_answered_count < 0: # في حالة وجود خطأ أو بيانات غير متناسقة (يجب ألا يحدث نظريا)
+        if not_answered_count < 0:
             not_answered_count = 0
 
         sorted_participants = sorted(final_scores.items(), key=lambda item: item[1]['score'], reverse=True)
@@ -508,7 +591,6 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
 
             get_user_info = None
             try:
-                # هذا سيعمل إذا كان winner_id هو user_id للمستخدم
                 get_user_info = await telegram_bot.get_chat_member(chat_id=winner_id, user_id=winner_id)
             except Exception as e:
                 logger.warning(f"Worker: [{quiz_key}] Could not fetch winner info for {winner_id} via get_chat: {e}")
@@ -519,17 +601,13 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
                     if user_api_data.get("username"):
                         winner_username_escaped = f"@{html.escape(user_api_data['username'])}"
                     elif user_api_data.get("first_name"):
-                        # استخدم الرابط القابل للنقر
                         winner_username_escaped = f"<a href='tg://user?id={user_api_data['id']}'>{user_api_data['first_name']}</a>"
                     else:
-                        # إذا لم يتم العثور على اسم مستخدم أو اسم أول، استخدم الاسم من Redis
                         winner_username_escaped = winner_data.get('username', f"User_{winner_id}")
                 else:
-                    # إذا كانت بيانات الـ API فارغة، استخدم الاسم من Redis
                     winner_username_escaped = winner_data.get('username', f"User_{winner_id}")
             else:
-                # إذا فشل جلب المعلومات من Telegram API (not ok أو get_user_info هو None)،
-                # استخدم الاسم الذي تم جلبه من Redis
+                # **هنا تم التصحيح: إزالة الاقتباس المفرد غير المغلق**
                 winner_username_escaped = winner_data.get('username', f"User_{winner_id}")
 
 
@@ -542,7 +620,6 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
         else:
             results_text += "😞 لم يشارك أحد في المسابقة أو لم يحصل أحد على نقاط.\n\n"
 
-        # إحصائيات المشاركة الجديدة
         results_text += f"{BLOCKQUOTE_OPEN_TAG}"
         results_text += f"📊 <b>إحصائيات المشاركة:</b>\n"
         results_text += f"• إجمالي اللاعبين المسجلين: {total_registered_players}\n"
@@ -554,7 +631,7 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
         if len(sorted_participants) > 0:
             results_text += f"🏅 <b>لوحة المتصدرين:</b>\n"
             leaderboard_content = ""
-            for i, (user_id, data) in enumerate(sorted_participants[:30]): # عرض أعلى 30 متسابقاً
+            for i, (user_id, data) in enumerate(sorted_participants[:30]):
                 rank_emoji = ""
                 if i == 0: rank_emoji = "🥇 "
                 elif i == 1: rank_emoji = "🥈 "
@@ -562,12 +639,10 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
 
                 leaderboard_content += f"{rank_emoji}{ltr}{i+1}. {data['username']}: {data['score']}{pdf} نقطة\n"
 
-            # **تطبيق تنسيق Blockquote expandable لطي لوحة المتصدرين**
             results_text += f"{BLOCKQUOTE_OPEN_TAG}\n{leaderboard_content}{BLOCKQUOTE_CLOSE_TAG}\n"
         else:
             results_text += "😔 لا توجد نتائج لعرضها.\n"
 
-        # إضافة التوقيع إلى الرسالة النهائية
         if signature_text:
             results_text += f"\n{signature_text}"
 
@@ -580,7 +655,7 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
                 total_points = data['score']
                 username_for_db = data['username']
                 correct_answers_count = sum(1 for q_score in data['answers'].values() if q_score > 0)
-                total_answered_questions_count = len(data['answers']) # عدد الأسئلة التي أجاب عليها هذا المستخدم
+                total_answered_questions_count = len(data['answers'])
                 wrong_answers_count = total_answered_questions_count - correct_answers_count
 
                 await sqlite_handler.update_user_stats(stats_db_path, user_id, username_for_db, total_points, correct_answers_count, wrong_answers_count)
@@ -589,6 +664,12 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
             logger.info(f"Worker: [{quiz_key}] Quiz results saved to SQLite successfully.")
         except Exception as e:
             logger.error(f"Worker: [{quiz_key}] Failed to save quiz results to SQLite: {e}", exc_info=True)
+            await send_admin_notification(
+                bot_token,
+                f"<b>خطأ في حفظ نتائج المسابقة:</b> {quiz_key}\n"
+                f"السبب: {html.escape(str(e))}\n"
+                f"الرجاء التحقق من قاعدة البيانات SQLite."
+            )
 
         message_data = {"text": results_text, "reply_markup": json.dumps({}),
                         'disable_web_page_preview': True,
@@ -629,14 +710,27 @@ async def main_loop():
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for i, result in enumerate(results):
                     if isinstance(result, Exception):
-                        logger.error(f"Worker: An error occurred while processing quiz {active_quiz_keys_to_process[i]}: {result}", exc_info=result)
+                        quiz_key = active_quiz_keys_to_process[i]
+                        logger.error(f"Worker: An error occurred while processing quiz {quiz_key}: {result}", exc_info=result)
+                        try:
+                            quiz_status_for_error = await redis_handler.get_quiz_status_by_key(quiz_key)
+                            bot_token_for_error = quiz_status_for_error.get("bot_token") if quiz_status_for_error else None
+                            if bot_token_for_error:
+                                await send_admin_notification(
+                                    bot_token_for_error,
+                                    f"<b>خطأ عام في معالجة المسابقة:</b> {quiz_key}\n"
+                                    f"السبب: {html.escape(str(result))}\n"
+                                    f"الرجاء التحقق من سجلات الخادم."
+                                )
+                        except Exception as inner_e:
+                            logger.error(f"Worker: Failed to send admin notification for general processing error: {inner_e}")
             else:
                 logger.debug("Worker: No active quizzes (after filtering) found. Waiting...")
 
         except Exception as e:
             logger.error(f"Worker: An critical error occurred in the main loop: {e}", exc_info=True)
 
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1)
 
 if __name__ == "__main__":
     try:
