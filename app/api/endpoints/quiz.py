@@ -103,10 +103,11 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         "parse_mode": "HTML"
     }
 
-    # **التصحيح: إعداد الحالة والمؤقت في Redis *قبل* محاولة تعديل الرسالة**
-    # هذا يضمن أن المسابقة تعتبر "نشطة" مع مؤقت دقيق، بغض النظر عن تأخيرات الشبكة.
+    # Corrected Logic: Set timer and state in Redis *before* the network call.
+    # Also, correctly source `max_players` from the existing Redis state.
+    max_players_from_status = int(current_quiz_status.get("max_players", 12))
 
-    # 1. تهيئة المسابقة في Redis
+    # 1. Initialize the quiz in Redis, setting its status to active.
     await redis_handler.start_quiz(
         bot_token=request.bot_token,
         quiz_unique_id=quiz_unique_id,
@@ -116,54 +117,50 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         time_per_question=request.question_delay,
         creator_id=int(current_quiz_status.get('creator_id', 0)),
         initial_participant_count=initial_participants_count,
-        max_players=request.max_players
+        max_players=max_players_from_status
     )
 
-    # 2. تحديث حالة المسابقة إلى "نشطة" وتعيين بيانات السؤال الأول
+    # 2. Update the quiz fields for the first question display.
     data_to_set_in_redis = {
         "current_question_text": base_question_text_for_redis,
         "current_keyboard": json.dumps(keyboard),
-        "status": "active",
+        "status": "active", # The quiz is now active
         "category_display_name": display_category_name,
         "current_index": 0,
-        "max_players": request.max_players
+        "max_players": max_players_from_status
     }
     await redis_handler.redis_client.hset(quiz_key, mapping=data_to_set_in_redis)
 
-    # 3. إعداد مؤقت السؤال الأول
+    # 3. Set the timer for the first question.
     end_time = datetime.now() + timedelta(seconds=request.question_delay)
     await redis_handler.set_current_question(request.bot_token, quiz_unique_id, first_question['id'], end_time)
 
     logger.info(f"API: [{quiz_unique_id}] State set to 'active' in Redis. Timer started. Now attempting to edit Telegram message.")
 
-    # 4. الآن، حاول تعديل الرسالة في تيليجرام
+    # 4. Now, attempt to edit the message on Telegram.
     sent_message = None
     try:
         if inline_message_id:
             message_params["inline_message_id"] = inline_message_id
             sent_message = await asyncio.wait_for(telegram_bot.edit_inline_message(message_params), timeout=10.0)
-            logger.info(f"API: Telegram edit_inline_message response for first question: {sent_message}")
         elif chat_id_from_redis and message_id_from_redis:
             message_params["chat_id"] = chat_id_from_redis
             message_params["message_id"] = message_id_from_redis
             sent_message = await asyncio.wait_for(telegram_bot.edit_message(message_params), timeout=10.0)
-            logger.info(f"API: Telegram edit_message response for first question: {sent_message}")
         else:
             logger.error(f"API: No valid message identifier found for quiz {quiz_unique_id}. Cannot send/edit message.")
-            # المسابقة بدأت بالفعل في Redis، لكن لا يمكننا عرضها. قد يقوم العامل بتنظيفها.
             raise HTTPException(status_code=500, detail="خطأ داخلي: لم يتم العثور على معرّف الرسالة لبدء المسابقة.")
 
         if not sent_message.get("ok"):
             logger.error(f"API: Failed to update message in Telegram: {sent_message.get('description')}")
-            # نفس الملاحظة أعلاه، المسابقة بدأت ولكن الرسالة فشلت.
             raise HTTPException(status_code=500, detail=f"فشل في تعديل الرسالة الأولى في تيليجرام: {sent_message.get('description')}")
 
     except asyncio.TimeoutError:
         logger.error(f"API: Timed out while sending/editing first message for quiz {quiz_unique_id}. The quiz is active in Redis and will proceed.")
-        # لا نثير استثناء هنا، لأن المسابقة بدأت بالفعل. سيتعامل العامل معها.
+        # Do not raise an exception here, as the quiz has already started. The worker will handle it.
     except Exception as e:
         logger.error(f"API: Error sending/editing first message for quiz {quiz_unique_id}: {e}", exc_info=True)
-        # نفس الملاحظة، لا نثير استثناء يوقف العملية.
+        # Same as above, do not raise, let the worker handle the state.
 
     logger.info(f"API: Competition started successfully for bot {request.bot_token} with identifier {quiz_unique_id}. Quiz state saved to Redis.")
     return {"message": "Competition started."}
