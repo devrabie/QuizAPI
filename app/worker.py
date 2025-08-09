@@ -484,6 +484,27 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             f"⏳ <b>الوقت المتبقي</b>: {time_per_question} ثانية"
         )
 
+        # **التصحيح: إعداد المؤقت وحالة السؤال في Redis *قبل* إرسال التحديث إلى تيليجرام**
+        # هذا يضمن أن المؤقت دقيق ولا يتأثر بتأخيرات الشبكة.
+
+        end_time = datetime.now() + timedelta(seconds=time_per_question)
+        bot_token = quiz_status.get("bot_token")
+        quiz_identifier = quiz_status.get("quiz_identifier")
+
+        # 1. تحديث حالة المسابقة في Redis أولاً
+        await redis_handler.redis_client.hset(
+            quiz_key, mapping={
+                "current_question_text": base_question_text_for_redis,
+                "current_keyboard": json.dumps(keyboard),
+                "current_index": next_index
+            }
+        )
+        # 2. إعداد مؤقت السؤال الجديد
+        await redis_handler.set_current_question(bot_token, quiz_identifier, next_question_id, end_time)
+        logger.info(f"Worker: [{quiz_key}] State updated for Q{next_index + 1}. Timer set for {time_per_question}s.")
+
+        # 3. الآن، قم بإرسال الرسالة إلى تيليجرام
+        # لم يعد من الضروري تحديث العرض بالقوة مرتين، فالدورة الرئيسية ستلتقط التغيير
         message_data = {
             "text": full_new_question_message_text,
             "reply_markup": json.dumps(keyboard),
@@ -493,29 +514,12 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
         logger.info(f"Worker: [{quiz_key}] Attempting to edit message for Q{next_index + 1} (ID: {next_question_id}).")
         await _send_telegram_update(quiz_key, telegram_bot, message_data, quiz_status)
 
+        # التحقق من الحالة بعد إرسال الرسالة لا يزال مهمًا
         current_status = await redis_handler.redis_client.hget(quiz_key, "status")
         if current_status == "stopping":
-            logger.info(f"Worker: [{quiz_key}] Quiz status changed to 'stopping' after attempting to edit message. Aborting next question setup.")
+            logger.info(f"Worker: [{quiz_key}] Quiz status changed to 'stopping' after attempting to edit message. Finalizing.")
             await end_quiz(quiz_key, quiz_status, telegram_bot)
             return
-
-
-        end_time = datetime.now() + timedelta(seconds=time_per_question)
-
-        bot_token = quiz_status.get("bot_token")
-        quiz_identifier = quiz_status.get("quiz_identifier")
-        await redis_handler.set_current_question(bot_token, quiz_identifier, next_question_id, end_time)
-        await redis_handler.redis_client.hset(
-            quiz_key, mapping={
-                "current_question_text": base_question_text_for_redis,
-                "current_keyboard": json.dumps(keyboard),
-                "current_index": next_index
-            }
-        )
-
-        logger.info(f"Worker: [{quiz_key}] State updated. New current_index: {next_index}. Timer set for {time_per_question}s.")
-        refreshed_quiz_status = await redis_handler.get_quiz_status_by_key(quiz_key)
-        await update_question_display(quiz_key, refreshed_quiz_status, telegram_bot, time_per_question, force_update=True)
 
     else:
         logger.info(f"Worker: [{quiz_key}] End of questions reached. Finishing up.")

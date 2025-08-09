@@ -103,6 +103,40 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         "parse_mode": "HTML"
     }
 
+    # **التصحيح: إعداد الحالة والمؤقت في Redis *قبل* محاولة تعديل الرسالة**
+    # هذا يضمن أن المسابقة تعتبر "نشطة" مع مؤقت دقيق، بغض النظر عن تأخيرات الشبكة.
+
+    # 1. تهيئة المسابقة في Redis
+    await redis_handler.start_quiz(
+        bot_token=request.bot_token,
+        quiz_unique_id=quiz_unique_id,
+        questions_db_path=request.questions_db_path,
+        stats_db_path=request.stats_db_path,
+        question_ids=question_ids,
+        time_per_question=request.question_delay,
+        creator_id=int(current_quiz_status.get('creator_id', 0)),
+        initial_participant_count=initial_participants_count,
+        max_players=request.max_players
+    )
+
+    # 2. تحديث حالة المسابقة إلى "نشطة" وتعيين بيانات السؤال الأول
+    data_to_set_in_redis = {
+        "current_question_text": base_question_text_for_redis,
+        "current_keyboard": json.dumps(keyboard),
+        "status": "active",
+        "category_display_name": display_category_name,
+        "current_index": 0,
+        "max_players": request.max_players
+    }
+    await redis_handler.redis_client.hset(quiz_key, mapping=data_to_set_in_redis)
+
+    # 3. إعداد مؤقت السؤال الأول
+    end_time = datetime.now() + timedelta(seconds=request.question_delay)
+    await redis_handler.set_current_question(request.bot_token, quiz_unique_id, first_question['id'], end_time)
+
+    logger.info(f"API: [{quiz_unique_id}] State set to 'active' in Redis. Timer started. Now attempting to edit Telegram message.")
+
+    # 4. الآن، حاول تعديل الرسالة في تيليجرام
     sent_message = None
     try:
         if inline_message_id:
@@ -116,47 +150,20 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
             logger.info(f"API: Telegram edit_message response for first question: {sent_message}")
         else:
             logger.error(f"API: No valid message identifier found for quiz {quiz_unique_id}. Cannot send/edit message.")
+            # المسابقة بدأت بالفعل في Redis، لكن لا يمكننا عرضها. قد يقوم العامل بتنظيفها.
             raise HTTPException(status_code=500, detail="خطأ داخلي: لم يتم العثور على معرّف الرسالة لبدء المسابقة.")
 
         if not sent_message.get("ok"):
             logger.error(f"API: Failed to update message in Telegram: {sent_message.get('description')}")
+            # نفس الملاحظة أعلاه، المسابقة بدأت ولكن الرسالة فشلت.
             raise HTTPException(status_code=500, detail=f"فشل في تعديل الرسالة الأولى في تيليجرام: {sent_message.get('description')}")
 
     except asyncio.TimeoutError:
-        logger.error(f"API: Timed out while sending/editing first message for quiz {quiz_unique_id}.")
-        raise HTTPException(status_code=504, detail="خطأ في الاتصال بتيليجرام: انتهت المهلة عند تعديل الرسالة الأولى.")
+        logger.error(f"API: Timed out while sending/editing first message for quiz {quiz_unique_id}. The quiz is active in Redis and will proceed.")
+        # لا نثير استثناء هنا، لأن المسابقة بدأت بالفعل. سيتعامل العامل معها.
     except Exception as e:
         logger.error(f"API: Error sending/editing first message for quiz {quiz_unique_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"خطأ أثناء تعديل الرسالة الأولى للمسابقة: {e}")
-
-    # تهيئة المسابقة في Redis (تتضمن الآن participant_count)
-    # **تمرير max_players إلى start_quiz ليكون متاحًا في حالة المسابقة**
-    await redis_handler.start_quiz(
-        bot_token=request.bot_token,
-        quiz_unique_id=quiz_unique_id,
-        questions_db_path=request.questions_db_path,
-        stats_db_path=request.stats_db_path,
-        question_ids=question_ids,
-        time_per_question=request.question_delay,
-        creator_id=int(current_quiz_status.get('creator_id', 0)),
-        initial_participant_count=initial_participants_count, # **تمرير العداد المحسوب**
-        max_players=request.max_players # **إضافة هذا السطر**
-    )
-
-    # تحديث حقول المسابقة بعد بدء أول سؤال (خاصة للعرض)
-    data_to_set_in_redis = {
-        "current_question_text": base_question_text_for_redis,
-        "current_keyboard": json.dumps(keyboard),
-        "status": "active", # الآن المسابقة نشطة
-        "category_display_name": display_category_name,
-        "current_index": 0, # بدء من السؤال الأول
-        "max_players": request.max_players # **تأكيد وجودها في حالة المسابقة النشطة**
-    }
-    await redis_handler.redis_client.hset(quiz_key, mapping=data_to_set_in_redis)
-
-    # إعداد مؤقت السؤال الأول
-    end_time = datetime.now() + timedelta(seconds=request.question_delay)
-    await redis_handler.set_current_question(request.bot_token, quiz_unique_id, first_question['id'], end_time)
+        # نفس الملاحظة، لا نثير استثناء يوقف العملية.
 
     logger.info(f"API: Competition started successfully for bot {request.bot_token} with identifier {quiz_unique_id}. Quiz state saved to Redis.")
     return {"message": "Competition started."}
