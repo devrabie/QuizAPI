@@ -17,18 +17,17 @@ async def _get_db_version(db: aiosqlite.Connection) -> int:
         row = await cursor.fetchone()
         return row[0] if row else 0
     except aiosqlite.OperationalError:
-        # إذا كان الجدول schema_info غير موجود، افترض الإصدار 0 (أو أول ترحيل)
         return 0
 
 async def _set_db_version(db: aiosqlite.Connection, version: int):
     """يضبط إصدار المخطط في قاعدة البيانات."""
     await db.execute('CREATE TABLE IF NOT EXISTS schema_info (version INTEGER PRIMARY KEY)')
     await db.execute("INSERT OR REPLACE INTO schema_info (version) VALUES (?)", (version,))
-    # لا تقم بعمل commit هنا، سيتم ذلك بشكل مجمع في الدالة الرئيسية ensure_db_schema_latest
+    await db.commit() # <--- التغيير الرئيسي: إضافة commit هنا
+    logger.info(f"DB: تم تحديث إصدار مخطط الإحصائيات في القاعدة إلى {version}.")
 
 async def _column_exists(db: aiosqlite.Connection, table_name: str, column_name: str) -> bool:
     """يتحقق مما إذا كان العمود موجودًا بالفعل في الجدول."""
-    # تأكد أن اسم الجدول صالح لتجنب حقن SQL
     if not table_name.replace('_', '').isalnum():
         raise ValueError(f"اسم الجدول غير صالح: {table_name}")
     cursor = await db.execute(f"PRAGMA table_info({table_name})")
@@ -39,7 +38,7 @@ async def _column_exists(db: aiosqlite.Connection, table_name: str, column_name:
 
 async def _migrate_to_v1(db: aiosqlite.Connection):
     """ترحيل إلى الإصدار 1: إنشاء الجداول الأولية (النقاط كـ INTEGER)."""
-    # لا حاجة لـ db.commit() هنا، سيتم تجميعها
+    # بما أن commit سيتم بعد _set_db_version، لا نحتاج commit هنا.
     await db.execute('''
         CREATE TABLE IF NOT EXISTS quiz_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,7 +157,7 @@ async def ensure_db_schema_latest(db_path: str):
     try:
         db = await aiosqlite.connect(db_path)
 
-        # **تعطيل قيود المفاتيح الخارجية قبل بدء أي ترحيلات**
+        # تعطيل قيود المفاتيح الخارجية قبل بدء أي ترحيلات
         await db.execute("PRAGMA foreign_keys = OFF;")
 
         current_version = await _get_db_version(db)
@@ -168,38 +167,35 @@ async def ensure_db_schema_latest(db_path: str):
             logger.info(f"DB: {db_path} - بدء عملية ترحيل المخطط...")
 
             # تطبيق الترحيلات بالتسلسل
+            # كل ترحيل سيقوم بعمل commit الخاص به الآن
             if current_version < 1:
                 await _migrate_to_v1(db)
-                await _set_db_version(db, 1)
-                current_version = 1 # تحديث الإصدار الحالي لتجنب إعادة التطبيق في نفس الجولة
+                await _set_db_version(db, 1) # هذا الآن يقوم بعمل commit
+                current_version = 1
 
             if current_version < 2:
                 await _migrate_to_v2(db)
-                await _set_db_version(db, 2)
+                await _set_db_version(db, 2) # هذا الآن يقوم بعمل commit
                 current_version = 2
 
             if current_version < 3:
                 await _migrate_to_v3(db)
-                await _set_db_version(db, 3)
+                await _set_db_version(db, 3) # هذا الآن يقوم بعمل commit
                 current_version = 3
 
-            # **تأكيد جميع التغييرات في معاملة واحدة فقط بعد اكتمال جميع الترحيلات**
-            await db.commit()
-            logger.info(f"DB: {db_path} - اكتملت عملية ترحيل المخطط بنجاح. الإصدار الجديد: {await _get_db_version(db)}")
+            logger.info(f"DB: {db_path} - اكتملت عملية ترحيل المخطط بنجاح. الإصدار الجديد: {current_version}")
         else:
             logger.info(f"DB: {db_path} - مخطط الإحصائيات محدث بالفعل.")
 
     except Exception as e:
         logger.critical(f"DB: فشل حرج أثناء عملية ترحيل المخطط لـ {db_path}: {e}", exc_info=True)
         if db:
-            # **التراجع عن جميع التغييرات في حالة حدوث أي خطأ**
             logger.info(f"DB: {db_path} - جاري التراجع عن التغييرات...")
-            await db.rollback()
-        raise # إعادة رفع الاستثناء ليتم التعامل معه في الطبقات الأعلى (مثل FastAPI)
+            await db.rollback() # سيقوم بالتراجع عن أي تغييرات لم يتم حفظها بعد
+        raise
     finally:
         if db:
-            # **إعادة تمكين قيود المفاتيح الخارجية قبل إغلاق الاتصال**
-            # هذا مهم حتى لو فشل الترحيل، لضمان بقاء قاعدة البيانات في حالة معروفة.
+            # إعادة تمكين قيود المفاتيح الخارجية قبل إغلاق الاتصال
             try:
                 await db.execute("PRAGMA foreign_keys = ON;")
             except Exception as inner_e:
@@ -207,7 +203,6 @@ async def ensure_db_schema_latest(db_path: str):
             await db.close()
 
 # --- دوال الوصول إلى قاعدة بيانات الأسئلة (تعمل على ملف منفصل) ---
-# هذه الدوال لا تستخدم نظام الترحيل لأنها تتعامل مع قاعدة بيانات مختلفة.
 
 async def get_questions_general(db_path: str, count: int = 10) -> list:
     """يستعلم من قاعدة بيانات الأسئلة (questions.db)."""
@@ -235,7 +230,6 @@ async def get_question_by_id(db_path: str, question_id: int) -> dict | None:
 
 
 # --- دوال الوصول إلى قاعدة بيانات الإحصائيات (تعمل على ملف stats.db) ---
-# هذه الدوال تفترض أن الترحيل قد تم بنجاح وأن المخطط صحيح.
 
 async def save_quiz_history(db_path: str, quiz_identifier: str, total_questions: int, winner_id: int | None, winner_score: float | None, chat_id: int | None) -> int:
     """يحفظ في قاعدة بيانات الإحصائيات (stats.db)."""
