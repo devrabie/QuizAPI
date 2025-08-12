@@ -158,26 +158,27 @@ async def ensure_db_schema_latest(db_path: str):
         if current_version < CURRENT_DB_SCHEMA_VERSION:
             logger.info(f"DB: {db_path} - بدء عملية ترحيل المخطط...")
 
-            # تطبيق الترحيلات بالتسلسل، كل ترحيل في معاملة خاصة به
+            # ** تعطيل المفاتيح الخارجية قبل بدء أي ترحيلات **
+            await db.execute("PRAGMA foreign_keys = OFF;")
+            await db.commit()
+
+            # تطبيق الترحيلات بالتسلسل
             if current_version < 1:
-                async with db.transaction():
-                    await _migrate_to_v1(db)
-                    await _set_db_version(db, 1)
+                await _migrate_to_v1(db)
+                await _set_db_version(db, 1)
+                await db.commit()
                 current_version = 1
 
             if current_version < 2:
-                async with db.transaction():
-                    await _migrate_to_v2(db)
-                    await _set_db_version(db, 2)
+                await _migrate_to_v2(db)
+                await _set_db_version(db, 2)
+                await db.commit()
                 current_version = 2
 
             if current_version < 3:
-                # هذا الترحيل يتطلب تعطيل المفاتيح الخارجية
-                await db.execute("PRAGMA foreign_keys = OFF;")
-                async with db.transaction():
-                    await _migrate_to_v3(db)
-                    await _set_db_version(db, 3)
-                await db.execute("PRAGMA foreign_keys = ON;")
+                await _migrate_to_v3(db)
+                await _set_db_version(db, 3)
+                await db.commit()
                 current_version = 3
 
             logger.info(f"DB: {db_path} - اكتملت عملية ترحيل المخطط بنجاح. الإصدار الجديد: {current_version}")
@@ -186,13 +187,16 @@ async def ensure_db_schema_latest(db_path: str):
 
     except Exception as e:
         logger.critical(f"DB: فشل حرج أثناء عملية ترحيل المخطط لـ {db_path}: {e}", exc_info=True)
-        # لا حاجة لـ rollback هنا لأننا نستخدم `async with db.transaction()`
+        if db:
+            logger.info(f"DB: {db_path} - جاري التراجع عن التغييرات...")
+            await db.rollback()
         raise
     finally:
         if db:
-            # التأكد من إعادة تمكين المفاتيح الخارجية
+            # إعادة تمكين قيود المفاتيح الخارجية قبل إغلاق الاتصال
             try:
                 await db.execute("PRAGMA foreign_keys = ON;")
+                await db.commit()
             except Exception as inner_e:
                 logger.error(f"DB: فشل إعادة تمكين قيود المفاتيح الخارجية لـ {db_path}: {inner_e}")
             await db.close()
