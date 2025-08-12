@@ -23,7 +23,6 @@ async def _set_db_version(db: aiosqlite.Connection, version: int):
     """يضبط إصدار المخطط في قاعدة البيانات."""
     await db.execute('CREATE TABLE IF NOT EXISTS schema_info (version INTEGER PRIMARY KEY)')
     await db.execute("INSERT OR REPLACE INTO schema_info (version) VALUES (?)", (version,))
-    await db.commit() # <--- التغيير الرئيسي: إضافة commit هنا
     logger.info(f"DB: تم تحديث إصدار مخطط الإحصائيات في القاعدة إلى {version}.")
 
 async def _column_exists(db: aiosqlite.Connection, table_name: str, column_name: str) -> bool:
@@ -38,7 +37,6 @@ async def _column_exists(db: aiosqlite.Connection, table_name: str, column_name:
 
 async def _migrate_to_v1(db: aiosqlite.Connection):
     """ترحيل إلى الإصدار 1: إنشاء الجداول الأولية (النقاط كـ INTEGER)."""
-    # بما أن commit سيتم بعد _set_db_version، لا نحتاج commit هنا.
     await db.execute('''
         CREATE TABLE IF NOT EXISTS quiz_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,7 +83,6 @@ async def _migrate_to_v3(db: aiosqlite.Connection):
     ترحيل إلى الإصدار 3: تغيير أعمدة النقاط إلى REAL.
     يتطلب إعادة بناء الجداول.
     """
-    # 1. ترحيل quiz_history
     await db.execute("ALTER TABLE quiz_history RENAME TO quiz_history_old")
     await db.execute('''
         CREATE TABLE quiz_history (
@@ -106,7 +103,6 @@ async def _migrate_to_v3(db: aiosqlite.Connection):
     await db.execute("DROP TABLE quiz_history_old")
     logger.info("DB: تم ترحيل quiz_history إلى REAL (v3).")
 
-    # 2. ترحيل quiz_participants
     await db.execute("ALTER TABLE quiz_participants RENAME TO quiz_participants_old")
     await db.execute('''
         CREATE TABLE quiz_participants (
@@ -126,7 +122,6 @@ async def _migrate_to_v3(db: aiosqlite.Connection):
     await db.execute("DROP TABLE quiz_participants_old")
     logger.info("DB: تم ترحيل quiz_participants إلى REAL (v3).")
 
-    # 3. ترحيل user_stats
     await db.execute("ALTER TABLE user_stats RENAME TO user_stats_old")
     await db.execute('''
         CREATE TABLE user_stats (
@@ -157,30 +152,32 @@ async def ensure_db_schema_latest(db_path: str):
     try:
         db = await aiosqlite.connect(db_path)
 
-        # تعطيل قيود المفاتيح الخارجية قبل بدء أي ترحيلات
-        await db.execute("PRAGMA foreign_keys = OFF;")
-
         current_version = await _get_db_version(db)
         logger.info(f"DB: {db_path} - إصدار مخطط الإحصائيات الحالي: {current_version}, الإصدار المطلوب: {CURRENT_DB_SCHEMA_VERSION}")
 
         if current_version < CURRENT_DB_SCHEMA_VERSION:
             logger.info(f"DB: {db_path} - بدء عملية ترحيل المخطط...")
 
-            # تطبيق الترحيلات بالتسلسل
-            # كل ترحيل سيقوم بعمل commit الخاص به الآن
+            # تطبيق الترحيلات بالتسلسل، كل ترحيل في معاملة خاصة به
             if current_version < 1:
-                await _migrate_to_v1(db)
-                await _set_db_version(db, 1) # هذا الآن يقوم بعمل commit
+                async with db.transaction():
+                    await _migrate_to_v1(db)
+                    await _set_db_version(db, 1)
                 current_version = 1
 
             if current_version < 2:
-                await _migrate_to_v2(db)
-                await _set_db_version(db, 2) # هذا الآن يقوم بعمل commit
+                async with db.transaction():
+                    await _migrate_to_v2(db)
+                    await _set_db_version(db, 2)
                 current_version = 2
 
             if current_version < 3:
-                await _migrate_to_v3(db)
-                await _set_db_version(db, 3) # هذا الآن يقوم بعمل commit
+                # هذا الترحيل يتطلب تعطيل المفاتيح الخارجية
+                await db.execute("PRAGMA foreign_keys = OFF;")
+                async with db.transaction():
+                    await _migrate_to_v3(db)
+                    await _set_db_version(db, 3)
+                await db.execute("PRAGMA foreign_keys = ON;")
                 current_version = 3
 
             logger.info(f"DB: {db_path} - اكتملت عملية ترحيل المخطط بنجاح. الإصدار الجديد: {current_version}")
@@ -189,13 +186,11 @@ async def ensure_db_schema_latest(db_path: str):
 
     except Exception as e:
         logger.critical(f"DB: فشل حرج أثناء عملية ترحيل المخطط لـ {db_path}: {e}", exc_info=True)
-        if db:
-            logger.info(f"DB: {db_path} - جاري التراجع عن التغييرات...")
-            await db.rollback() # سيقوم بالتراجع عن أي تغييرات لم يتم حفظها بعد
+        # لا حاجة لـ rollback هنا لأننا نستخدم `async with db.transaction()`
         raise
     finally:
         if db:
-            # إعادة تمكين قيود المفاتيح الخارجية قبل إغلاق الاتصال
+            # التأكد من إعادة تمكين المفاتيح الخارجية
             try:
                 await db.execute("PRAGMA foreign_keys = ON;")
             except Exception as inner_e:
