@@ -17,16 +17,20 @@ async def _get_db_version(db: aiosqlite.Connection) -> int:
         row = await cursor.fetchone()
         return row[0] if row else 0
     except aiosqlite.OperationalError:
+        # إذا كان الجدول schema_info غير موجود، افترض الإصدار 0 (أو أول ترحيل)
         return 0
 
 async def _set_db_version(db: aiosqlite.Connection, version: int):
     """يضبط إصدار المخطط في قاعدة البيانات."""
     await db.execute('CREATE TABLE IF NOT EXISTS schema_info (version INTEGER PRIMARY KEY)')
     await db.execute("INSERT OR REPLACE INTO schema_info (version) VALUES (?)", (version,))
-    # لا تقم بعمل commit هنا، سيتم ذلك بشكل مجمع في الدالة الرئيسية
+    # لا تقم بعمل commit هنا، سيتم ذلك بشكل مجمع في الدالة الرئيسية ensure_db_schema_latest
 
 async def _column_exists(db: aiosqlite.Connection, table_name: str, column_name: str) -> bool:
     """يتحقق مما إذا كان العمود موجودًا بالفعل في الجدول."""
+    # تأكد أن اسم الجدول صالح لتجنب حقن SQL
+    if not table_name.replace('_', '').isalnum():
+        raise ValueError(f"اسم الجدول غير صالح: {table_name}")
     cursor = await db.execute(f"PRAGMA table_info({table_name})")
     columns = await cursor.fetchall()
     return any(col[1] == column_name for col in columns)
@@ -35,6 +39,7 @@ async def _column_exists(db: aiosqlite.Connection, table_name: str, column_name:
 
 async def _migrate_to_v1(db: aiosqlite.Connection):
     """ترحيل إلى الإصدار 1: إنشاء الجداول الأولية (النقاط كـ INTEGER)."""
+    # لا حاجة لـ db.commit() هنا، سيتم تجميعها
     await db.execute('''
         CREATE TABLE IF NOT EXISTS quiz_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +71,7 @@ async def _migrate_to_v1(db: aiosqlite.Connection):
             last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    logger.info("DB: تم إنشاء الجداول الأولية (v1).")
 
 async def _migrate_to_v2(db: aiosqlite.Connection):
     """ترحيل إلى الإصدار 2: إضافة عمود chat_id إلى quiz_history (بشكل آمن)."""
@@ -76,7 +82,10 @@ async def _migrate_to_v2(db: aiosqlite.Connection):
         logger.info("DB: العمود chat_id موجود بالفعل في quiz_history. تخطي الترحيل v2.")
 
 async def _migrate_to_v3(db: aiosqlite.Connection):
-    """ترحيل إلى الإصدار 3: تغيير أعمدة النقاط إلى REAL."""
+    """
+    ترحيل إلى الإصدار 3: تغيير أعمدة النقاط إلى REAL.
+    يتطلب إعادة بناء الجداول.
+    """
     # 1. ترحيل quiz_history
     await db.execute("ALTER TABLE quiz_history RENAME TO quiz_history_old")
     await db.execute('''
@@ -139,6 +148,7 @@ async def _migrate_to_v3(db: aiosqlite.Connection):
     await db.execute("DROP TABLE user_stats_old")
     logger.info("DB: تم ترحيل user_stats إلى REAL (v3).")
 
+
 async def ensure_db_schema_latest(db_path: str):
     """
     يضمن أن مخطط قاعدة بيانات الإحصائيات محدث.
@@ -147,7 +157,9 @@ async def ensure_db_schema_latest(db_path: str):
     db = None
     try:
         db = await aiosqlite.connect(db_path)
-        await db.execute("PRAGMA foreign_keys = ON;")
+
+        # **تعطيل قيود المفاتيح الخارجية قبل بدء أي ترحيلات**
+        await db.execute("PRAGMA foreign_keys = OFF;")
 
         current_version = await _get_db_version(db)
         logger.info(f"DB: {db_path} - إصدار مخطط الإحصائيات الحالي: {current_version}, الإصدار المطلوب: {CURRENT_DB_SCHEMA_VERSION}")
@@ -155,20 +167,23 @@ async def ensure_db_schema_latest(db_path: str):
         if current_version < CURRENT_DB_SCHEMA_VERSION:
             logger.info(f"DB: {db_path} - بدء عملية ترحيل المخطط...")
 
-            # ** بدء المعاملة اليدوية **
+            # تطبيق الترحيلات بالتسلسل
             if current_version < 1:
                 await _migrate_to_v1(db)
                 await _set_db_version(db, 1)
+                current_version = 1 # تحديث الإصدار الحالي لتجنب إعادة التطبيق في نفس الجولة
 
             if current_version < 2:
                 await _migrate_to_v2(db)
                 await _set_db_version(db, 2)
+                current_version = 2
 
             if current_version < 3:
                 await _migrate_to_v3(db)
                 await _set_db_version(db, 3)
+                current_version = 3
 
-            # ** تنفيذ جميع التغييرات في المعاملة **
+            # **تأكيد جميع التغييرات في معاملة واحدة فقط بعد اكتمال جميع الترحيلات**
             await db.commit()
             logger.info(f"DB: {db_path} - اكتملت عملية ترحيل المخطط بنجاح. الإصدار الجديد: {await _get_db_version(db)}")
         else:
@@ -177,16 +192,22 @@ async def ensure_db_schema_latest(db_path: str):
     except Exception as e:
         logger.critical(f"DB: فشل حرج أثناء عملية ترحيل المخطط لـ {db_path}: {e}", exc_info=True)
         if db:
-            # ** التراجع عن جميع التغييرات في حالة حدوث أي خطأ **
+            # **التراجع عن جميع التغييرات في حالة حدوث أي خطأ**
             logger.info(f"DB: {db_path} - جاري التراجع عن التغييرات...")
             await db.rollback()
-        raise
+        raise # إعادة رفع الاستثناء ليتم التعامل معه في الطبقات الأعلى (مثل FastAPI)
     finally:
         if db:
+            # **إعادة تمكين قيود المفاتيح الخارجية قبل إغلاق الاتصال**
+            # هذا مهم حتى لو فشل الترحيل، لضمان بقاء قاعدة البيانات في حالة معروفة.
+            try:
+                await db.execute("PRAGMA foreign_keys = ON;")
+            except Exception as inner_e:
+                logger.error(f"DB: فشل إعادة تمكين قيود المفاتيح الخارجية لـ {db_path}: {inner_e}")
             await db.close()
 
-
 # --- دوال الوصول إلى قاعدة بيانات الأسئلة (تعمل على ملف منفصل) ---
+# هذه الدوال لا تستخدم نظام الترحيل لأنها تتعامل مع قاعدة بيانات مختلفة.
 
 async def get_questions_general(db_path: str, count: int = 10) -> list:
     """يستعلم من قاعدة بيانات الأسئلة (questions.db)."""
@@ -214,6 +235,7 @@ async def get_question_by_id(db_path: str, question_id: int) -> dict | None:
 
 
 # --- دوال الوصول إلى قاعدة بيانات الإحصائيات (تعمل على ملف stats.db) ---
+# هذه الدوال تفترض أن الترحيل قد تم بنجاح وأن المخطط صحيح.
 
 async def save_quiz_history(db_path: str, quiz_identifier: str, total_questions: int, winner_id: int | None, winner_score: float | None, chat_id: int | None) -> int:
     """يحفظ في قاعدة بيانات الإحصائيات (stats.db)."""
