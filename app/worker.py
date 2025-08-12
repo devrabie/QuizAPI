@@ -22,7 +22,7 @@ except ImportError:
 bot_instances = {}
 
 # **إعدادات البوت**
-ADMIN_TELEGRAM_ID = 6198033039
+ADMIN_TELEGRAM_ID = 6198033039 # يجب تغيير هذا إلى معرف المطور الخاص بك
 
 # **إعدادات منظم الطلبات**
 bot_rate_limiter = {}
@@ -136,15 +136,15 @@ async def _send_telegram_update(quiz_key: str, telegram_bot: TelegramBotServiceA
                     "status": "stopping",
                     "stop_reason": "message_deleted"
                 })
-                await send_admin_notification(
-                    bot_token,
-                    f"<b>خطأ حرج في المسابقة (رسالة محذوفة):</b> {quiz_key}\n"
-                    f"معرف الرسالة: <code>{message_id}</code>\n"
-                    f"معرف المحادثة: <code>{chat_id}</code>\n"
-                    f"السبب: {error_reason}\n"
-                    f"وصف تيليجرام: {html.escape(desc)}\n"
-                    f"المسابقة تم إيقافها وسيتم إعلام المنشئ."
-                )
+                # await send_admin_notification(
+                #     bot_token,
+                #     f"<b>خطأ حرج في المسابقة (رسالة محذوفة):</b> {quiz_key}\n"
+                #     f"معرف الرسالة: <code>{message_id}</code>\n"
+                #     f"معرف المحادثة: <code>{chat_id}</code>\n"
+                #     f"السبب: {error_reason}\n"
+                #     f"وصف تيليجرام: {html.escape(desc)}\n"
+                #     f"المسابقة تم إيقافها وسيتم إعلام المنشئ."
+                # )
                 return response
 
             elif "bot was blocked by the user" in desc: critical_error, error_reason = True, "البوت تم حظره."
@@ -300,7 +300,7 @@ async def display_round_results(quiz_key: str, quiz_status: dict, telegram_bot: 
             # التحقق من الإقصاء
             if eliminate_after > 0 and wrong_answers_total >= eliminate_after:
                 # التأكد من عدم إقصاء اللاعبين الذين أجابوا بشكل صحيح في هذه الجولة
-                # هذه قائمة بأسماء اللاعبين الذين تم إقصائهم في هذه الجولة أو قبلها وظهروا الآن
+                # هذه قائمة بأسماء اللاعبين الذين تم إقصاءهم في هذه الجولة أو قبلها وظهروا الآن
                 if answer_data.get('eliminated') != "1": # إذا لم يتم إقصاؤه بالفعل
                     eliminated_players_list.append(username)
                     await redis_handler.redis_client.hset(redis_handler.quiz_answers_key(quiz_status["bot_token"], quiz_identifier, user_id), "eliminated", "1")
@@ -418,14 +418,26 @@ async def process_active_quiz(quiz_key: str):
 
 async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotServiceAsync):
     current_index = int(quiz_status.get("current_index", -1))
-
-    # جلب عدد المشاركين الحاليين (باستثناء اللاعبين المقُصّين)
     quiz_identifier = quiz_status.get("quiz_identifier")
+    bot_token = quiz_status.get("bot_token") # تم التأكد من توفره هنا
+
+    # جلب جميع اللاعبين الذين انضموا إلى المسابقة (بغض النظر عما إذا كانوا قد أجابوا أم لا)
+    registered_players_json = quiz_status.get('players', '[]')
+    try:
+        registered_players = json.loads(registered_players_json)
+    except json.JSONDecodeError:
+        logger.warning(f"Worker: [{quiz_key}] لم يتمكن من فك ترميز JSON 'players'. يفترض عدم وجود لاعبين مسجلين.")
+        registered_players = []
+
     active_players_count = 0
-    async for key in redis_handler.redis_client.scan_iter(f"QuizAnswers:{quiz_status['bot_token']}:{quiz_identifier}:*"):
-        user_data = await redis_handler.redis_client.hgetall(key)
-        if user_data.get("eliminated") != "1":
-            active_players_count += 1
+    for player_info in registered_players:
+        user_id = player_info.get('id')
+        if user_id: # التأكد من وجود user_id
+            user_answers_key = redis_handler.quiz_answers_key(bot_token, quiz_identifier, user_id)
+            user_data = await redis_handler.redis_client.hgetall(user_answers_key)
+            # يعتبر اللاعب نشطًا إذا لم يتم إقصاؤه بشكل صريح
+            if user_data.get("eliminated") != "1":
+                active_players_count += 1
 
     # إذا تم إقصاء جميع اللاعبين النشطين، قم بإنهاء المسابقة
     if active_players_count == 0:
@@ -469,7 +481,7 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
         )
 
         end_time = datetime.now() + timedelta(seconds=time_per_question)
-        bot_token = quiz_status.get("bot_token")
+        # bot_token تم تعريفه في بداية الدالة
 
         await redis_handler.redis_client.hset(
             quiz_key, mapping={
