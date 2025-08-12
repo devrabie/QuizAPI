@@ -151,35 +151,34 @@ async def ensure_db_schema_latest(db_path: str):
     db = None
     try:
         db = await aiosqlite.connect(db_path)
-
         current_version = await _get_db_version(db)
         logger.info(f"DB: {db_path} - إصدار مخطط الإحصائيات الحالي: {current_version}, الإصدار المطلوب: {CURRENT_DB_SCHEMA_VERSION}")
 
         if current_version < CURRENT_DB_SCHEMA_VERSION:
             logger.info(f"DB: {db_path} - بدء عملية ترحيل المخطط...")
-
-            # ** تعطيل المفاتيح الخارجية قبل بدء أي ترحيلات **
             await db.execute("PRAGMA foreign_keys = OFF;")
             await db.commit()
 
-            # تطبيق الترحيلات بالتسلسل
-            if current_version < 1:
-                await _migrate_to_v1(db)
-                await _set_db_version(db, 1)
-                await db.commit()
-                current_version = 1
+            # استخدام حلقة while لضمان التطبيق التسلسلي والصحيح
+            while current_version < CURRENT_DB_SCHEMA_VERSION:
+                next_version = current_version + 1
+                logger.info(f"DB: {db_path} - جاري الترحيل من الإصدار {current_version} إلى {next_version}...")
 
-            if current_version < 2:
-                await _migrate_to_v2(db)
-                await _set_db_version(db, 2)
-                await db.commit()
-                current_version = 2
+                if next_version == 1:
+                    await _migrate_to_v1(db)
+                elif next_version == 2:
+                    await _migrate_to_v2(db)
+                elif next_version == 3:
+                    await _migrate_to_v3(db)
+                # أضف elif للترحيلات المستقبلية هنا
+                else:
+                    logger.warning(f"DB: {db_path} - لا يوجد ترحيل محدد للإصدار {next_version}. إيقاف العملية.")
+                    break # الخروج من الحلقة إذا كان الإصدار التالي غير معروف
 
-            if current_version < 3:
-                await _migrate_to_v3(db)
-                await _set_db_version(db, 3)
+                await _set_db_version(db, next_version)
                 await db.commit()
-                current_version = 3
+                # إعادة قراءة الإصدار من قاعدة البيانات لضمان صحة الدورة التالية
+                current_version = await _get_db_version(db)
 
             logger.info(f"DB: {db_path} - اكتملت عملية ترحيل المخطط بنجاح. الإصدار الجديد: {current_version}")
         else:
@@ -193,7 +192,6 @@ async def ensure_db_schema_latest(db_path: str):
         raise
     finally:
         if db:
-            # إعادة تمكين قيود المفاتيح الخارجية قبل إغلاق الاتصال
             try:
                 await db.execute("PRAGMA foreign_keys = ON;")
                 await db.commit()
