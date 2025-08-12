@@ -22,7 +22,7 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
     quiz_unique_id = request.quiz_identifier
     quiz_key = redis_handler.quiz_key(request.bot_token, quiz_unique_id)
 
-    await sqlite_handler.ensure_db_schema_latest(request.stats_db_path)
+    # await sqlite_handler.ensure_db_schema_latest(request.stats_db_path)
 
     category_to_fetch = request.category
     questions = []
