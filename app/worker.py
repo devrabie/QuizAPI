@@ -192,8 +192,7 @@ async def update_question_display(quiz_key: str, quiz_status: dict, telegram_bot
         f"❓ {base_question_text_from_redis}\n\n"
         f"🏷️ <b>الفئة</b>: {html.escape(category_display_name)}\n"
         f"👥 <b>المشاركون</b>: {participants}\n"
-        f"⏳ <b>الوقت المتبقي</b>: {int(time_left + 0.99)} ثانية"
-    )
+        f"⏳ <b>الوقت المتبقي</b>: {int(time_left + 0.99)} ثانية")
 
     current_keyboard_str = quiz_status.get("current_keyboard")
     if not current_keyboard_str:
