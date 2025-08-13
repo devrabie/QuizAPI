@@ -160,6 +160,9 @@ async def start_competition(request: quiz_models.StartCompetitionRequest):
         logger.error(f"API: خطأ في إرسال/تعديل الرسالة الأولى للمسابقة {quiz_unique_id}: {e}", exc_info=True)
         pass
 
+    # أنشئ task للـ timer هنا للسؤال الأول
+    asyncio.create_task(question_timer(quiz_key))
+
     logger.info(f"API: بدأت المسابقة بنجاح للبوت {request.bot_token} بمعرف {quiz_unique_id}. تم حفظ حالة المسابقة في Redis.")
     return {"message": "بدأت المسابقة."}
 
