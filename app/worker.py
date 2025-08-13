@@ -26,7 +26,7 @@ ADMIN_TELEGRAM_ID = 6198033039 # يجب تغيير هذا إلى معرف الم
 
 # **إعدادات منظم الطلبات**
 bot_rate_limiter = {}
-RATE_LIMIT_TOKENS_PER_SECOND = 2.0
+RATE_LIMIT_TOKENS_PER_SECOND = 5.0  # زيادة لتقليل التأخير
 RATE_LIMIT_BUCKET_SIZE = 10
 
 # تعريف علامات HTML لطي النص
@@ -136,15 +136,6 @@ async def _send_telegram_update(quiz_key: str, telegram_bot: TelegramBotServiceA
                     "status": "stopping",
                     "stop_reason": "message_deleted"
                 })
-                # await send_admin_notification(
-                #     bot_token,
-                #     f"<b>خطأ حرج في المسابقة (رسالة محذوفة):</b> {quiz_key}\n"
-                #     f"معرف الرسالة: <code>{message_id}</code>\n"
-                #     f"معرف المحادثة: <code>{chat_id}</code>\n"
-                #     f"السبب: {error_reason}\n"
-                #     f"وصف تيليجرام: {html.escape(desc)}\n"
-                #     f"المسابقة تم إيقافها وسيتم إعلام المنشئ."
-                # )
                 return response
 
             elif "bot was blocked by the user" in desc: critical_error, error_reason = True, "البوت تم حظره."
@@ -336,7 +327,7 @@ async def display_round_results(quiz_key: str, quiz_status: dict, telegram_bot: 
 
 async def process_active_quiz(quiz_key: str):
     processing_lock_key = f"Lock:Process:{quiz_key}"
-    if not await redis_handler.redis_client.set(processing_lock_key, "true", ex=10, nx=True):
+    if not await redis_handler.redis_client.set(processing_lock_key, "true", ex=2, nx=True):  # قفل أقصر
         return
 
     try:
@@ -366,54 +357,65 @@ async def process_active_quiz(quiz_key: str):
         quiz_time_key_str = redis_handler.quiz_time_key(bot_token, quiz_identifier)
         quiz_time = await redis_handler.redis_client.hgetall(quiz_time_key_str)
 
-        current_question_ended = False
         if quiz_time and "end" in quiz_time:
             try:
                 end_time = datetime.fromisoformat(quiz_time["end"])
-                if datetime.now() >= end_time:
-                    current_question_ended = True
-                else:
-                    time_left = (end_time - datetime.now()).total_seconds()
-                    time_per_question = int(quiz_status.get('time_per_question', 30))
-                    mid_update_sent = quiz_status.get('mid_update_sent', '0') == '1'
-
-                    if time_left <= (time_per_question / 2) and not mid_update_sent:
-                        logger.info(f"Worker: [{quiz_key}] وصلت لنقطة المنتصف. إرسال تحديث منتصف المسابقة.")
-                        await update_question_display(quiz_key, quiz_status, telegram_bot, time_left)
-                        await redis_handler.redis_client.hset(quiz_key, "mid_update_sent", "1")
-
+                time_left = (end_time - datetime.now()).total_seconds()
+                if time_left > 0:
+                    # إذا لم ينتهِ، لا تفعل شيئًا هنا، الـ task سيتعامل
+                    return
             except (ValueError, TypeError):
-                current_question_ended = True # التعامل مع خطأ التحليل على أنه انتهاء الوقت
-        else:
-            current_question_ended = True # إذا لم يكن هناك مؤقت، انتقل إلى السؤال التالي فوراً
+                pass
 
-        if current_question_ended:
-            round_results_displayed_at_str = quiz_status.get("round_results_displayed_at")
-            if round_results_displayed_at_str:
-                try:
-                    round_display_time = datetime.fromisoformat(round_results_displayed_at_str)
-                    if (datetime.now() - round_display_time).total_seconds() < ROUND_RESULT_DISPLAY_DURATION_SECONDS:
-                        # لا يزال يتم عرض نتائج الجولة، انتظر
-                        logger.debug(f"Worker: [{quiz_key}] في انتظار انتهاء مدة عرض نتائج الجولة.")
-                        return # لا تعالج السؤال التالي بعد
-                    else:
-                        # انتهت مدة عرض نتائج الجولة، امسح العلامة وتابع إلى السؤال التالي
-                        await redis_handler.redis_client.hdel(quiz_key, "round_results_displayed_at")
-                        await handle_next_question(quiz_key, quiz_status, telegram_bot)
-                except (ValueError, TypeError):
-                    logger.warning(f"Worker: [{quiz_key}] لم يتمكن من تحليل طابع الوقت round_results_displayed_at: {round_results_displayed_at_str}. المضي قدماً.")
-                    await handle_next_question(quiz_key, quiz_status, telegram_bot)
-            else:
-                # انتهى السؤال، لكن نتائج الجولة لم تُعرض بعد. اعرضها الآن.
-                logger.info(f"Worker: [{quiz_key}] انتهى وقت السؤال. عرض نتائج الجولة قبل السؤال التالي.")
-                await display_round_results(quiz_key, quiz_status, telegram_bot)
-                return # انتظر التكرار التالي في الحلقة لمعالجة مدة العرض
-
-        # إذا لم يكن السؤال الحالي قد انتهى بعد، فسيتم التعامل مع ذلك بواسطة update_question_display في الأجزاء السابقة.
-        # لذا، لا يوجد المزيد من `should_process_next_question` هنا إلا بعد انتهاء مدة عرض النتائج.
+        # إذا وصل هنا، انتهى الوقت أو خطأ، لكن الـ task الرئيسي سيتعامل
 
     finally:
         await redis_handler.redis_client.delete(processing_lock_key)
+
+
+async def question_timer(quiz_key: str):
+    quiz_status = await redis_handler.get_quiz_status_by_key(quiz_key)
+    if not quiz_status or quiz_status.get("status") != "active":
+        return
+
+    telegram_bot = get_telegram_bot(quiz_status["bot_token"])
+    bot_token = quiz_status["bot_token"]
+    quiz_identifier = quiz_status["quiz_identifier"]
+    time_per_question = int(quiz_status.get('time_per_question', 30))
+
+    while quiz_status.get("status") == "active":
+        quiz_time_key_str = redis_handler.quiz_time_key(bot_token, quiz_identifier)
+        quiz_time = await redis_handler.redis_client.hgetall(quiz_time_key_str)
+
+        if quiz_time and "end" in quiz_time:
+            try:
+                end_time = datetime.fromisoformat(quiz_time["end"])
+                time_left = (end_time - datetime.now()).total_seconds()
+
+                if time_left > 0:
+                    # تحديث منتصف إذا لزم
+                    mid_update_sent = quiz_status.get('mid_update_sent', '0') == '1'
+                    if time_left <= (time_per_question / 2) and not mid_update_sent:
+                        await update_question_display(quiz_key, quiz_status, telegram_bot, time_left)
+                        await redis_handler.redis_client.hset(quiz_key, "mid_update_sent", "1")
+
+                    # انتظر حتى انتهاء الوقت
+                    await asyncio.sleep(time_left)
+                # عرض نتائج
+                await display_round_results(quiz_key, quiz_status, telegram_bot)
+                # انتظر 4 ثواني
+                await asyncio.sleep(ROUND_RESULT_DISPLAY_DURATION_SECONDS)
+                # السؤال التالي
+                await handle_next_question(quiz_key, quiz_status, telegram_bot)
+
+                # تحديث quiz_status للدورة التالية
+                quiz_status = await redis_handler.get_quiz_status_by_key(quiz_key)
+
+            except (ValueError, TypeError):
+                logger.warning(f"Worker: [{quiz_key}] خطأ في end_time.")
+                break
+        else:
+            break
 
 
 async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotServiceAsync):
@@ -500,6 +502,8 @@ async def handle_next_question(quiz_key: str, quiz_status: dict, telegram_bot: T
             "parse_mode": "HTML"
         }
         await _send_telegram_update(quiz_key, telegram_bot, message_data, quiz_status)
+
+        # لا تنشئ task هنا، فهو يدار في question_timer
 
     else:
         logger.info(f"Worker: [{quiz_key}] تمت معالجة جميع الأسئلة. إنهاء المسابقة.")
@@ -591,9 +595,6 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
             winner_score = winner_data['total_score']
             try:
                 # محاولة الحصول على معلومات مستخدم تيليجرام الكاملة للفائز
-                # استخدام creator_id أو chat_id_for_history لـ chat_id في get_chat_member
-                # هذا سيفشل إذا كان الفائز ليس في نفس المحادثة أو لم يكن البوت عضواً فيها.
-                # الأسلوب الأكثر أماناً هو استخدام user_id نفسه لـ chat_id إذا كان المستخدم يسمح بالبوت في PM.
                 get_user_info = await telegram_bot.get_chat_member(chat_id=int(quiz_status.get('creator_id', winner_id)), user_id=int(winner_id))
                 if get_user_info and get_user_info.get("ok"):
                     user_api_data = get_user_info.get("result", {})
@@ -706,6 +707,8 @@ async def end_quiz(quiz_key: str, quiz_status: dict, telegram_bot: TelegramBotSe
         logger.info(f"Worker: [{quiz_key}] تم تنظيف المسابقة من Redis وتحرير القفل.")
 
 
+active_quiz_tasks = {}  # dictionary لتتبع tasks لكل quiz_key
+
 async def main_loop():
     logger.info("Worker: بدء الحلقة الرئيسية...")
     ignore_keywords = [":askquestion", ":newpost", ":Newpost", ":stats", ":leaderboard", ":start", "Panel"]
@@ -713,13 +716,22 @@ async def main_loop():
         try:
             all_quiz_keys = [key async for key in redis_handler.redis_client.scan_iter("Quiz:*:*")]
             active_quiz_keys_to_process = [key for key in all_quiz_keys if not any(keyword in key for keyword in ignore_keywords)]
-            if active_quiz_keys_to_process:
-                tasks = [process_active_quiz(key) for key in active_quiz_keys_to_process]
-                await asyncio.gather(*tasks, return_exceptions=True)
+            for key in active_quiz_keys_to_process:
+                quiz_status = await redis_handler.get_quiz_status_by_key(key)
+                if quiz_status and quiz_status.get("status") == "active" and key not in active_quiz_tasks:
+                    # أنشئ task للـ timer إذا كانت active جديدة
+                    active_quiz_tasks[key] = asyncio.create_task(question_timer(key))
+                await process_active_quiz(key)  # للـ pending وstopping
+
+            # تنظيف tasks المنتهية
+            completed = [k for k, t in active_quiz_tasks.items() if t.done()]
+            for k in completed:
+                del active_quiz_tasks[k]
+
         except Exception as e:
             logger.error(f"Worker: حدث خطأ حرج في الحلقة الرئيسية: {e}", exc_info=True)
 
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(1.0)  # فاصل أطول لأن الـ tasks تدير الـ timers
 
 if __name__ == "__main__":
     try:
